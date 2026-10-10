@@ -14,7 +14,8 @@ Five classes of red, per inventory row (credplane PLAN_unattended-push-keys.md (
 4. ``log``: a legacy log shows an ssh auth failure that no later success cleared;
 5. ``policy``: a write repository is not append-only (GitHub effective rules
    without ``deletion``/``non_fast_forward``, GitLab branch unprotected, force
-   push allowed or the deploy key missing from ``allowed_to_push``).
+   push allowed, developers' push level not 30 or the deploy key missing from
+   ``allowed_to_push`` — :func:`protected_branch_problem`, shared with reconcile).
 
 ``offline`` (``-d``) skips everything that needs the network (probe, stuck,
 policy). Checks never push, pull, fetch or write anything but their own
@@ -48,6 +49,9 @@ AUTH_FAIL_RE = re.compile(
     r"Could not read from remote repository",
     re.IGNORECASE,
 )
+
+#: GitLab access level "Developers + Maintainers".
+DEVELOPER_ACCESS = 30
 
 
 @dataclass(frozen=True)
@@ -474,12 +478,32 @@ class Checker:
         data = self.api("glab", f"projects/{project}/protected_branches/{branch}", key.host) or {}
         if key.policy_id is not None and data.get("id") != key.policy_id:
             return f"protected branch id {data.get('id')} != policy_id {key.policy_id}"
-        if data.get("allow_force_push") is not False:
-            return "force push is allowed"
-        pushers = {lvl.get("deploy_key_id") for lvl in data.get("push_access_levels") or []}
-        if key.remote_key_id not in pushers:
-            return f"deploy key {key.remote_key_id} is not in allowed_to_push"
-        return ""
+        return protected_branch_problem(data, key.remote_key_id)
+
+
+def protected_branch_problem(data: dict[str, Any], remote_key_id: int | None) -> str:
+    """Why *data* (a protected-branch read-back) is not the expected policy ('' when it is).
+
+    Expected: force push off, a role-level push entry at Developer (30) and the
+    deploy key among the pushers. Shared by ``check`` and ``reconcile`` so the
+    health check and the provisioning verify can never disagree.
+    """
+    if data.get("allow_force_push") is not False:
+        return "allows force push"
+    levels = data.get("push_access_levels") or []
+    roles = {
+        lvl.get("access_level")
+        for lvl in levels
+        if lvl.get("deploy_key_id") is None
+        and lvl.get("user_id") is None
+        and lvl.get("group_id") is None
+    }
+    if DEVELOPER_ACCESS not in roles:
+        found = sorted(r for r in roles if r is not None)
+        return f"has no Developer ({DEVELOPER_ACCESS}) push level (role levels: {found})"
+    if remote_key_id not in {lvl.get("deploy_key_id") for lvl in levels}:
+        return f"does not let deploy key {remote_key_id} push"
+    return ""
 
 
 def _safe(label: str) -> str:

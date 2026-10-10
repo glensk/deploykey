@@ -15,8 +15,9 @@ Order of one run (credplane PLAN_unattended-push-keys.md (i)/(j)):
    (GitHub) or the protected branches, deploy keys and project settings (GitLab)
    into the evidence directory, then verify or create the append-only rule —
    GitHub ruleset ``append-only-main`` (``deletion`` + ``non_fast_forward``, no
-   bypass actors), GitLab protected branch with ``allow_force_push=false`` and the
-   deploy key in ``allowed_to_push``.
+   bypass actors), GitLab protected branch with ``allow_force_push=false``,
+   ``push_access_level`` Developer (30) and the deploy key in ``allowed_to_push``
+   (see :func:`protected_branch_body` for why the role level is not an entry there).
 
 Rollback order (documented, never automated): restore the consumer → restore the
 policy from its snapshot → revoke the remote key → remove the local key material.
@@ -33,7 +34,12 @@ from pathlib import Path
 from typing import Any
 
 from ._common import RefusedError, write_json_atomic
-from .check import derive_fingerprint, fingerprint_of_public
+from .check import (
+    DEVELOPER_ACCESS,
+    derive_fingerprint,
+    fingerprint_of_public,
+    protected_branch_problem,
+)
 from .gitenv import check_file
 from .inventory import Inventory, Key, validate_refspec
 
@@ -304,21 +310,21 @@ class Reconciler:
                 raise RefusedError(f"{repo}: cannot read protected branch {branch}: {exc}") from exc
             data = None
         if data:
-            pushers = {lvl.get("deploy_key_id") for lvl in data.get("push_access_levels") or []}
             if self.key.policy_id is not None and data.get("id") != self.key.policy_id:
                 raise RefusedError(
                     f"{repo}: protected {branch} is id {data.get('id')}, "
                     f"inventory says {self.key.policy_id}"
                 )
-            if data.get("allow_force_push") is not False:
+            problem = protected_branch_problem(data, remote_key_id)
+            if problem:
                 raise RefusedError(
-                    f"{repo}: protected {branch} allows force push; fix it by hand, then rerun"
+                    f"{repo}: protected {branch} (id {data.get('id')}) {problem}; "
+                    "fix it by hand, then rerun"
                 )
-            if remote_key_id not in pushers:
-                raise RefusedError(
-                    f"{repo}: deploy key {remote_key_id} is not allowed to push to {branch}"
-                )
-            self.say(f"✅ {repo}:{branch} protected (id {data['id']}), deploy key may push")
+            self.say(
+                f"✅ {repo}:{branch} protected (id {data['id']}): developers + deploy key "
+                f"{remote_key_id} may push, no force push"
+            )
             return int(data["id"])
         if self.key.policy_id is not None:
             raise RefusedError(
@@ -327,15 +333,27 @@ class Reconciler:
         if self.dry_run or remote_key_id is None:
             self.say(f"would protect {repo}:{branch} (no force push, deploy key may push)")
             return None
-        body = {
-            "name": branch,
-            "allowed_to_push": [{"access_level": 30}, {"deploy_key_id": remote_key_id}],
-            "merge_access_level": 30,
-            "allow_force_push": False,
-        }
+        body = protected_branch_body(branch, remote_key_id)
         created = self._call(f"projects/{self.project}/protected_branches", "POST", body)
         self.say(f"✅ protected {repo}:{branch} (id {created['id']})")
         return int(created["id"])
+
+
+def protected_branch_body(branch: str, remote_key_id: int) -> dict[str, Any]:
+    """The GitLab protected-branch body that works on the Free tier (CE).
+
+    Developers keep push through ``push_access_level``: an ``{access_level: 30}``
+    entry inside ``allowed_to_push`` is Premium-only and CE may drop it silently,
+    while ``deploy_key_id`` entries are Free. Same shape as protected branch 1291
+    on gitlab.datascience.ch project 419.
+    """
+    return {
+        "name": branch,
+        "push_access_level": DEVELOPER_ACCESS,
+        "merge_access_level": DEVELOPER_ACCESS,
+        "allow_force_push": False,
+        "allowed_to_push": [{"deploy_key_id": remote_key_id}],
+    }
 
 
 def _ruleset_problem(ruleset: dict[str, Any], branch: str) -> str:

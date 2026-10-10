@@ -18,7 +18,7 @@ from deploykey._common import RefusedError
 from deploykey.audit import installed_jobs, run_audit
 from deploykey.check import Checker, fingerprint_of_public, run_check, uv_lock_sha
 from deploykey.inventory import build, normalize
-from deploykey.reconcile import Reconciler, ruleset_body
+from deploykey.reconcile import Reconciler, protected_branch_body, ruleset_body
 from deploykey.tools import ApiError
 
 from .support import GIT, Sandbox, run
@@ -32,6 +32,32 @@ def problems(report: Any, cls: str | None = None) -> list[str]:
     return [
         f.text for f in report.findings if f.level == "problem" and (cls is None or f.cls == cls)
     ]
+
+
+def branch_1291() -> dict[str, Any]:
+    """Read-back of gitlab.datascience.ch project 419 protected branch 1291 (P4.1)."""
+    return {
+        "id": 1291,
+        "name": "main",
+        "push_access_levels": [
+            {
+                "id": 1308,
+                "access_level": 40,
+                "access_level_description": "Mac deploykey gitlab-datascience-cscs-write (write)",
+                "deploy_key_id": 436,
+            },
+            {
+                "id": 1307,
+                "access_level": 30,
+                "access_level_description": "Developers + Maintainers",
+                "deploy_key_id": None,
+            },
+        ],
+        "merge_access_levels": [
+            {"id": 1303, "access_level": 30, "access_level_description": "Developers + Maintainers"}
+        ],
+        "allow_force_push": False,
+    }
 
 
 class FakeApi:
@@ -205,28 +231,40 @@ class CheckOnlineTest(Sandbox):
         self.assertTrue(any("authentication" in t for t in texts))
 
     def test_gitlab_policy(self) -> None:
-        """A GitLab protected branch passes only while force push stays disallowed."""
+        """Check accepts 1291's shape and reports each drift reconcile would refuse."""
         raw = self.raw_inventory(remote="git@gitlab.example.org:glensk/demo.git")
-        raw["key"][0]["host"] = "gitlab.example.org"
+        raw["key"][0].update(host="gitlab.example.org", remote_key_id=436, policy_id=1291)
         inv = build(raw)
-        branch = ("GET", "projects/glensk%2Fdemo/protected_branches/main")
-        checker_api = FakeApi(
-            {
-                branch: {
-                    "id": 22,
-                    "allow_force_push": False,
-                    "push_access_levels": [{"access_level": 30}, {"deploy_key_id": 11}],
-                }
-            }
-        )
-        checker = Checker(inv, helper=HELPER, api=checker_api.check)
-        checker.check_policy(inv.keys["github-demo-write"])
-        self.assertEqual([f.text for f in checker.findings], [])
-        checker_api.table[branch]["allow_force_push"] = True
-        checker.check_policy(inv.keys["github-demo-write"])
-        self.assertEqual(len(checker.findings), 1, checker.findings)
-        self.assertEqual(checker.findings[0].cls, "policy")
-        self.assertIn("force", checker.findings[0].text)
+        path = ("GET", "projects/glensk%2Fdemo/protected_branches/main")
+
+        def findings(branch: dict[str, Any]) -> list[Any]:
+            checker = Checker(inv, helper=HELPER, api=FakeApi({path: branch}).check)
+            checker.check_policy(inv.keys["github-demo-write"])
+            return checker.findings
+
+        self.assertEqual([f.text for f in findings(branch_1291())], [])
+
+        def no_developers(b: dict[str, Any]) -> None:
+            b["push_access_levels"][1]["access_level"] = 40
+
+        def no_key(b: dict[str, Any]) -> None:
+            del b["push_access_levels"][0]
+
+        def force(b: dict[str, Any]) -> None:
+            b["allow_force_push"] = True
+
+        for mutate, needle in (
+            (no_developers, "Developer"),
+            (no_key, "deploy key 436"),
+            (force, "force push"),
+        ):
+            with self.subTest(needle=needle):
+                branch = branch_1291()
+                mutate(branch)
+                found = findings(branch)
+                self.assertEqual(len(found), 1, found)
+                self.assertEqual(found[0].cls, "policy")
+                self.assertIn(needle, found[0].text)
 
 
 class AuditTest(Sandbox):
@@ -417,12 +455,84 @@ class ReconcileTest(Sandbox):
         body = next(
             c[3] for c in api.calls if c[1] == "POST" and c[2].endswith("protected_branches")
         )
-        self.assertEqual(body["allowed_to_push"], [{"access_level": 30}, {"deploy_key_id": 9}])
-        self.assertIs(body["allow_force_push"], False)
+        self.assertEqual(body, protected_branch_body("main", 9))
+        self.assertEqual(
+            body,
+            {
+                "name": "main",
+                "push_access_level": 30,
+                "merge_access_level": 30,
+                "allow_force_push": False,
+                "allowed_to_push": [{"deploy_key_id": 9}],
+            },
+        )
+        # an access-level entry inside allowed_to_push is Premium-only on GitLab CE
+        self.assertFalse([e for e in body["allowed_to_push"] if "access_level" in e])
         posted_key = next(
             c[3] for c in api.calls if c[1] == "POST" and c[2].endswith("deploy_keys")
         )
         self.assertIs(posted_key["can_push"], True)
+
+    def _gitlab_active(self, branch: dict[str, Any]) -> tuple[Reconciler, FakeApi]:
+        """An active GitLab key (deploy key 436, policy 1291) against a fake API."""
+        raw = self.raw_inventory()
+        raw["key"][0].update(
+            host="gitlab.example.org", repo="group/proj", remote_key_id=436, policy_id=1291
+        )
+        raw["consumer"] = [dict(raw["consumer"][0], remote="git@gitlab.example.org:group/proj.git")]
+        project = "projects/group%2Fproj"
+        api = FakeApi(
+            {
+                ("GET", f"{project}/deploy_keys"): [
+                    {"id": 436, "key": self._pub(self.key_path), "can_push": True}
+                ],
+                ("GET", f"{project}/protected_branches"): [branch],
+                ("GET", f"{project}/protected_branches/main"): branch,
+                ("GET", project): {"id": 419},
+            }
+        )
+        rec = Reconciler(
+            build(raw),
+            "github-demo-write",
+            api=api.reconcile,
+            policy=True,
+            evidence_dir=self.root / "ev",
+            say=lambda _s: None,
+        )
+        return rec, api
+
+    def test_gitlab_verify_branch_1291_is_noop(self) -> None:
+        """Re-running reconcile on the P4.1 shape verifies it and issues no write call."""
+        rec, api = self._gitlab_active(branch_1291())
+        out = rec.run()
+        self.assertEqual((out["remote_key_id"], out["policy_id"]), (436, 1291))
+        self.assertEqual([c for c in api.calls if c[1] != "GET"], [])
+
+    def test_gitlab_verify_refuses_drifted_branch(self) -> None:
+        """Force push on, developers' push lost or the deploy key missing is refused."""
+
+        def no_developers(b: dict[str, Any]) -> None:
+            b["push_access_levels"][1]["access_level"] = 40
+
+        def no_key(b: dict[str, Any]) -> None:
+            del b["push_access_levels"][0]
+
+        def force(b: dict[str, Any]) -> None:
+            b["allow_force_push"] = True
+
+        for mutate, needle in (
+            (no_developers, "Developer"),
+            (no_key, "deploy key 436"),
+            (force, "force push"),
+        ):
+            with self.subTest(needle=needle):
+                branch = branch_1291()
+                mutate(branch)
+                rec, api = self._gitlab_active(branch)
+                with self.assertRaises(RefusedError) as ctx:
+                    rec.run()
+                self.assertIn(needle, str(ctx.exception))
+                self.assertEqual([c for c in api.calls if c[1] != "GET"], [])
 
 
 TOML = """\
