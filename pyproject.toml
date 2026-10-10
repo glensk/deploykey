@@ -1,0 +1,76 @@
+[project]
+name = "deploykey"
+version = "0.1.0"
+description = "Repo-scoped ssh deploy keys for unattended git pushes/fetches: deploy-git (no free refspec, per-repo lock, evidence records) and an inventory checker."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Albert Glensk" }]
+keywords = ["git", "ssh", "deploy-key", "launchd", "automation"]
+# The runtime core (deploy-git, the library) is stdlib-only and runs on Python 3.9.
+# Only the admin commands (check policy, reconcile) resolve gh/glab through extdeps.
+dependencies = [
+    "extdeps @ git+https://github.com/glensk/extdeps@83196893a2966c8167c0a36a878883705746c9d9 ; python_version >= '3.10'",
+]
+
+[project.urls]
+Homepage = "https://github.com/glensk/deploykey"
+
+[project.scripts]
+deploy-git = "deploykey.cli_git:main"
+deploykey = "deploykey.cli_admin:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["deploykey"]
+
+[dependency-groups]
+dev = ["mypy>=1.14", "pylint>=3.3", "pytest>=8", "ruff>=0.9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "S"]
+# S603/S607: subprocess with fixed argv is the point of this package.
+ignore = ["S101", "S603", "S607"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S108"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["extdeps.*"]
+ignore_missing_imports = true
+
+[tool.pylint.main]
+py-version = "3.9"
+
+[tool.pylint."messages control"]
+disable = [
+    "duplicate-code",
+    "too-few-public-methods",
+    "too-many-arguments",
+    "too-many-instance-attributes",
+    "too-many-locals",
+    "too-many-positional-arguments",
+    "too-many-return-statements",
+    "too-many-branches",
+]
+
+[tool.pylint.format]
+max-line-length = 100
