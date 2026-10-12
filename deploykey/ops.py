@@ -8,6 +8,7 @@ commits where they are: there is no automatic rebase, the next cycle retries.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -170,6 +171,83 @@ def push(
     return _attempt(consumer, "push", body)
 
 
+def pull_ref(branch: str) -> str:
+    """The deploykey-owned local ref ``deploy-git pull`` fetches *branch* into."""
+    return f"refs/deploykey/pull/{branch}"
+
+
+def _pull_locked(
+    inv: Inventory, consumer: Consumer, env: Mapping[str, str], remote: str, branch: str
+) -> Outcome:
+    """Fetch *branch* into :func:`pull_ref`, then fast-forward HEAD to it. Caller holds the lock.
+
+    No ``git pull``: it merges whatever ``FETCH_HEAD`` holds, and a foreign fetch in the
+    same clone (an editor's git plugin, not stopped by our lock) can leave two merge
+    lines there — ``Cannot fast-forward to multiple branches`` (tp#925). The fetch
+    writes no ``FETCH_HEAD`` and, with an empty ``--refmap``, no ``refs/remotes/*``
+    either, so it shares no ref with a foreign fetcher. The tracking ref is moved
+    afterwards by :func:`_advance_tracking_ref`, compare-and-swap only.
+    """
+    private = pull_ref(branch)
+    tracking = f"refs/remotes/{remote}/{branch}"
+    seen = git(consumer, "rev-parse", "--verify", "--quiet", f"{tracking}^{{commit}}")
+    tracking_old = seen.stdout.strip() if seen.returncode == 0 else None
+    net_timeout = inv.settings.net_timeout_s or None
+    # `+` forces only the PRIVATE local ref deploykey owns — never a remote ref, so it
+    # is not a force push. It keeps a rewritten upstream from failing the fetch; the
+    # `merge --ff-only` below is the safety check and still refuses a non-fast-forward.
+    try:
+        fetch = git(
+            consumer,
+            "fetch",
+            "-q",
+            "--no-recurse-submodules",
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--refmap=",
+            remote,
+            f"+refs/heads/{branch}:{private}",
+            env=env,
+            timeout=net_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return Outcome(EXIT_FAILED, f"fetch timed out after {inv.settings.net_timeout_s}s")
+    if fetch.returncode != 0:
+        text = f"{fetch.stdout}\n{fetch.stderr}".strip()
+        return Outcome(EXIT_FAILED, f"fetch failed (git rc={fetch.returncode}): {_tail(text)}")
+    try:
+        # `env` carries submodule.recurse=false (git_env), so a global
+        # submodule.recurse=true does not make the merge update submodules.
+        merge = git(
+            consumer, "merge", "--ff-only", "-q", "--no-edit", private, env=env, timeout=net_timeout
+        )
+    except subprocess.TimeoutExpired:
+        return Outcome(EXIT_FAILED, f"merge timed out after {inv.settings.net_timeout_s}s")
+    if merge.returncode != 0:
+        text = f"{merge.stdout}\n{merge.stderr}".strip()
+        return Outcome(EXIT_FAILED, f"pull failed (git rc={merge.returncode}): {_tail(text)}")
+    new = git(consumer, "rev-parse", "HEAD").stdout.strip()
+    _advance_tracking_ref(consumer, tracking, new, tracking_old)
+    return Outcome(EXIT_OK, f"pulled {branch} from {consumer.remote} at {new[:12]}", None, new)
+
+
+def _advance_tracking_ref(consumer: Consumer, tracking: str, new: str, old: str | None) -> None:
+    """Move *tracking* from *old* to *new* if nothing else moved it; never fails the pull.
+
+    The ``--refmap=`` fetch leaves ``refs/remotes/<remote>/<branch>`` alone (no ref-lock
+    race with a foreign fetch), but on a clone nothing else fetches, ``git status`` would
+    then report "ahead N" for ever and mislead "is it pushed?" checks. So the ref is set
+    with a compare-and-swap against the value read before the fetch: if a foreign fetch
+    moved it in between, that fetch already updated it and the failed swap is ignored. A
+    tracking ref that did not exist is not created (the remote's fetch refspec may not
+    map the branch there).
+    """
+    if old is None or old == new:
+        return
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        git(consumer, "update-ref", "-m", "deploy-git pull", tracking, new, old)
+
+
 def pull(
     inv: Inventory,
     label: str,
@@ -177,7 +255,15 @@ def pull(
     *,
     lock_timeout: float | None = None,
 ) -> Outcome:
-    """``deploy-git pull``: ``git pull --ff-only -q <remote> <branch>`` with the read key."""
+    """``deploy-git pull``: fetch one branch with the read key, then ``merge --ff-only``.
+
+    Two steps under the repository lock: ``git fetch`` of ``refs/heads/<branch>`` into
+    the private ref ``refs/deploykey/pull/<branch>`` (no ``FETCH_HEAD``, no
+    remote-tracking ref), then ``git merge --ff-only`` of that ref into the checked-out
+    branch. A non-fast-forward fails (exit 4) and leaves the checkout untouched. After
+    a successful merge ``refs/remotes/<remote>/<branch>`` is advanced by compare-and-swap
+    (skipped if another fetch moved it meanwhile), so ``git status`` is not "ahead".
+    """
     consumer = inv.consumer(label)
     env_base = dict(os.environ if base is None else base)
 
@@ -192,33 +278,7 @@ def pull(
             raise RefusedError(f"{consumer.checkout} is on {head or 'a detached HEAD'}, not {ref}")
         timeout = inv.settings.lock_timeout_s if lock_timeout is None else lock_timeout
         with repo_lock(git_common_dir(consumer), timeout):
-            try:
-                proc = git(
-                    consumer,
-                    "pull",
-                    "--ff-only",
-                    "-q",
-                    "--no-recurse-submodules",
-                    remote,
-                    branch,
-                    env=env,
-                    timeout=inv.settings.net_timeout_s or None,
-                )
-            except subprocess.TimeoutExpired:
-                return Outcome(EXIT_FAILED, f"pull timed out after {inv.settings.net_timeout_s}s")
-            if proc.returncode != 0:
-                text = f"{proc.stdout}\n{proc.stderr}".strip()
-                return Outcome(
-                    EXIT_FAILED,
-                    f"pull failed (git rc={proc.returncode}): {_tail(text)}",
-                )
-            new = git(consumer, "rev-parse", "HEAD").stdout.strip()
-            return Outcome(
-                EXIT_OK,
-                f"pulled {branch} from {consumer.remote} at {new[:12]}",
-                None,
-                new,
-            )
+            return _pull_locked(inv, consumer, env, remote, branch)
 
     return _attempt(consumer, "pull", body)
 

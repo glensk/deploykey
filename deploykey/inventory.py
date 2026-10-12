@@ -121,7 +121,7 @@ def validate_refspec(refspec: Any, direction: str) -> tuple[str, str]:
     Write rows: exactly one ``<src>:refs/heads/<branch>``; refused are ``+``
     (force), ``*`` (wildcard), an empty source (deletion), several refs and any
     destination outside ``refs/heads/``. Read rows: exactly one
-    ``refs/heads/<branch>`` (the branch ``git pull --ff-only`` fetches); ``src``
+    ``refs/heads/<branch>`` (the branch ``deploy-git pull`` fetches and fast-forwards); ``src``
     and ``dst`` are then both that ref.
     """
     if not isinstance(refspec, str) or not refspec:

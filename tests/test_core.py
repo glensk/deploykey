@@ -409,6 +409,10 @@ class LockTest(Sandbox):
 class PullTest(Sandbox):
     """``deploykey.pull`` with the read key."""
 
+    def rev(self, ref: str) -> str:
+        """The sha *ref* names in the checkout."""
+        return run([GIT, "-C", self.checkout, "rev-parse", ref]).strip()
+
     def test_pull_fast_forwards(self) -> None:
         """Pull fast-forwards the checkout using the read key."""
         other = self.root / "other"
@@ -420,6 +424,114 @@ class PullTest(Sandbox):
         self.assertEqual(run([GIT, "-C", self.checkout, "rev-parse", "HEAD"]).strip(), sha)
         self.assertEqual(self.evidence("demo-pull")["remote_oid"], sha)
         self.assertIn(str(self.read_key_path), self.ssh_calls()[0])
+
+    def test_pull_survives_concurrent_foreign_fetch(self) -> None:
+        """A foreign ``git fetch`` looping in the clone never breaks pull (tp#925).
+
+        An editor's git plugin fetches in the same clone without deploykey's lock; with
+        ``git pull`` the two fetches interleaved on ``FETCH_HEAD`` ("Cannot fast-forward
+        to multiple branches") and on ``refs/remotes/origin/*``.
+        """
+        other = self.root / "other"
+        run([GIT, "clone", "-q", str(self.bare), other])
+        inv = self.inventory()
+        stop = threading.Event()
+        fetch_env = dict(os.environ, GIT_SSH_COMMAND=str(self.ssh))
+
+        def foreign_fetch() -> None:
+            while not stop.is_set():
+                subprocess.run(
+                    [GIT, "-C", str(self.checkout), "fetch", "-q", "origin"],
+                    capture_output=True,
+                    check=False,
+                    env=fetch_env,
+                )
+
+        thread = threading.Thread(target=foreign_fetch, daemon=True)
+        thread.start()
+        try:
+            for i in range(30):
+                sha = self.commit(other, "n.txt", f"{i}\n")
+                run([GIT, "-C", other, "push", "-q", "origin", "main"])
+                outcome = deploykey.pull(inv, "demo-pull")
+                with self.subTest(iteration=i):
+                    self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
+                    self.assertEqual(
+                        run([GIT, "-C", self.checkout, "rev-parse", "HEAD"]).strip(), sha
+                    )
+        finally:
+            stop.set()
+            thread.join()
+
+    def test_pull_refuses_non_fast_forward(self) -> None:
+        """A diverged checkout fails the merge (exit 4) and keeps its local commit."""
+        local = self.commit(self.checkout, "local.txt")
+        other = self.root / "other"
+        run([GIT, "clone", "-q", str(self.bare), other])
+        self.commit(other, "n.txt")
+        run([GIT, "-C", other, "push", "-q", "origin", "main"])
+        outcome = deploykey.pull(self.inventory(), "demo-pull")
+        self.assertEqual(outcome.rc, EXIT_FAILED)
+        self.assertIn("pull failed", outcome.message)
+        self.assertEqual(run([GIT, "-C", self.checkout, "rev-parse", "HEAD"]).strip(), local)
+
+    def test_pull_fetch_failure_message(self) -> None:
+        """A rejected key fails the fetch step (exit 4) with a ``fetch failed`` message."""
+        (self.root / "deny").write_text("")
+        outcome = deploykey.pull(self.inventory(), "demo-pull")
+        self.assertEqual(outcome.rc, EXIT_FAILED)
+        self.assertIn("fetch failed (git rc=", outcome.message)
+
+    def test_pull_touches_no_shared_fetch_state(self) -> None:
+        """No FETCH_HEAD; the tracking ref moves by compare-and-swap, so status is not ahead."""
+        other = self.root / "other"
+        run([GIT, "clone", "-q", str(self.bare), other])
+        sha = self.commit(other, "n.txt")
+        run([GIT, "-C", other, "push", "-q", "origin", "main"])
+        (self.checkout / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
+        self.assertEqual(deploykey.pull(self.inventory(), "demo-pull").rc, EXIT_OK)
+        self.assertFalse((self.checkout / ".git" / "FETCH_HEAD").exists())
+        self.assertEqual(self.rev(ops.pull_ref("main")), sha)
+        self.assertEqual(self.rev("HEAD"), sha)
+        self.assertEqual(self.rev("refs/remotes/origin/main"), sha)
+        status = run([GIT, "-C", self.checkout, "status", "-sb"]).splitlines()[0]
+        self.assertNotIn("ahead", status)
+        self.assertIn(
+            "deploy-git pull",
+            run([GIT, "-C", self.checkout, "reflog", "-1", "refs/remotes/origin/main"]),
+        )
+
+    def test_pull_tracking_ref_cas_lost_is_ignored(self) -> None:
+        """A lost compare-and-swap leaves the moved tracking ref alone and raises nothing."""
+        other = self.root / "other"
+        run([GIT, "clone", "-q", str(self.bare), other])
+        sha = self.commit(other, "n.txt")
+        run([GIT, "-C", other, "push", "-q", "origin", "main"])
+        consumer = self.inventory().consumer("demo-pull")
+        seed = run([GIT, "-C", self.checkout, "rev-parse", "HEAD"]).strip()
+        moved = run(
+            [GIT, "-C", self.checkout, "commit-tree", "-m", "x", f"{seed}^{{tree}}"]
+        ).strip()
+        run([GIT, "-C", self.checkout, "update-ref", "refs/remotes/origin/main", moved])
+        ops._advance_tracking_ref(  # pylint: disable=protected-access
+            consumer, "refs/remotes/origin/main", sha, seed
+        )
+        self.assertEqual(self.rev("refs/remotes/origin/main"), moved)
+
+    def test_pull_does_not_create_missing_tracking_ref(self) -> None:
+        """A tracking ref that did not exist before the pull is not created."""
+        run([GIT, "-C", self.checkout, "update-ref", "-d", "refs/remotes/origin/main"])
+        other = self.root / "other"
+        run([GIT, "clone", "-q", str(self.bare), other])
+        self.commit(other, "n.txt")
+        run([GIT, "-C", other, "push", "-q", "origin", "main"])
+        self.assertEqual(deploykey.pull(self.inventory(), "demo-pull").rc, EXIT_OK)
+        proc = subprocess.run(
+            [GIT, "-C", str(self.checkout), "rev-parse", "--verify", "--quiet",
+             "refs/remotes/origin/main"],
+            capture_output=True, check=False,
+        )  # fmt: skip
+        self.assertNotEqual(proc.returncode, 0)
 
     def test_pull_refuses_other_branch(self) -> None:
         """Pull refuses while another branch is checked out."""

@@ -7,7 +7,11 @@ inventory, and `deploy-git` pushes exactly that row's single refspec with that r
 
 - `deploy-git push <consumer>` — push the inventory refspec (e.g. `HEAD:refs/heads/main`)
   to the inventory remote with the consumer's write key.
-- `deploy-git pull <consumer>` — `git pull --ff-only` of one branch with a read key.
+- `deploy-git pull <consumer>` — fetch one branch with a read key into the private ref
+  `refs/deploykey/pull/<branch>`, then `git merge --ff-only` it (no `git pull`: a foreign
+  fetch in the same clone cannot race it on `FETCH_HEAD` or `refs/remotes/*`). The
+  remote-tracking ref is then advanced by compare-and-swap (left alone if another fetch
+  moved it meanwhile), so `git status` does not report "ahead".
 - `deploy-git run <consumer> -- <cmd…>` — under the repository lock, run the local commit
   command with `AI_PUSH_LOCAL_ONLY=1` and no key, then push.
 - `deploykey sync | check | audit | reconcile` — install the runtime inventory, health
@@ -53,6 +57,9 @@ pins it in its own project: `uv add "deploykey @ git+https://github.com/glensk/d
   `submodule.recurse=false` are appended through `GIT_CONFIG_COUNT`.
 - `flock` on `<git-common-dir>/deploykey.lock` around the whole commit+push transaction.
   A non-fast-forward rejection exits 4 and keeps the commit local: no automatic rebase.
+- `deploy-git pull` updates only its private ref `refs/deploykey/pull/<branch>`, with `+`
+  (a local ref deploykey owns — not a force push); the `merge --ff-only` that follows refuses
+  a non-fast-forward (exit 4) and leaves the checkout untouched.
 - Every attempt rewrites `<evidence>.json` (`last_attempt_at`, `last_attempt_rc`,
   `last_success_at`, `pushed_sha`, `remote_oid`, `helper_sha`); a failure keeps the last
   success fields.

@@ -21,7 +21,7 @@ exit codes: 0 ok, 2 usage, 3 refused (no network call was made),
 examples:
   deploy-git push sdsc-runai                       # push the row's refspec (HEAD:refs/heads/main)
   deploy-git push tp-autopilot:tp -W /abs/worktree # from a worktree of the same repository
-  deploy-git pull books-lists-pull                 # git pull --ff-only with the read key
+  deploy-git pull books-lists-pull                 # fetch + merge --ff-only, read key
   deploy-git run cscs-triage -- ai.py push -m "msg" f.pdf  # commit locally, then push
   deploy-git -c /tmp/inv.json push x               # another runtime inventory (tests)
   deploy-git -V                                    # the installed helper sha
