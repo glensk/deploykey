@@ -32,7 +32,7 @@ Pin an exact commit sha, never a tag or a branch:
 SHA=<commit sha>
 D=~/.local/share/deploykey/$SHA
 UV_TOOL_DIR=$D/tools UV_TOOL_BIN_DIR=$D/bin uv tool install git+https://github.com/glensk/deploykey@$SHA
-for b in deploy-git deploykey; do ln -sfn $D/bin/$b ~/.local/bin/.$b.new && mv -h ~/.local/bin/.$b.new ~/.local/bin/$b; done
+for b in deploy-git deploykey; do ln -sfn $D/bin/$b ~/.local/bin/.$b.new && /bin/mv -h ~/.local/bin/.$b.new ~/.local/bin/$b; done
 deploy-git -V        # prints $SHA (read from the install's PEP 610 direct_url.json)
 ```
 
