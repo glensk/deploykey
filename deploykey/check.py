@@ -20,12 +20,21 @@ Five classes of red, per inventory row (credplane PLAN_unattended-push-keys.md (
 ``offline`` (``-d``) skips everything that needs the network (probe, stuck,
 policy). Checks never push, pull, fetch or write anything but their own
 log-scan offsets under ``state_dir``.
+
+A run's network reads all start together (:meth:`Checker._prefetch`); the rules
+themselves stay sequential and single-threaded, and every finding is still
+recorded in inventory order. The reads are what the wall clock is made of, and
+each one is capped on its own, so reading them one after the other cost their
+*sum* — on the Mac's inventory 21 reads, i.e. a healthy ~25 s run that one
+stalled ssh connection pushed past the status hub's 90 s budget.
 """
 
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import datetime as _dt
+import functools
 import hashlib
 import os
 import re
@@ -52,6 +61,12 @@ AUTH_FAIL_RE = re.compile(
 
 #: GitLab access level "Developers + Maintainers".
 DEVELOPER_ACCESS = 30
+
+#: Most network reads a check run has in flight at once (:meth:`Checker._prefetch`).
+#: Every read is capped on its own (60 s for a probe, 60 s for an API call), so while
+#: the inventory has at most this many reads the whole run is bounded by ONE cap
+#: instead of by their sum; beyond it the bound grows to ``ceil(n / NET_WORKERS)`` caps.
+NET_WORKERS = 32
 
 
 @dataclass(frozen=True)
@@ -81,6 +96,8 @@ class Report:
 
 
 #: Test seam: ``api(tool, path, host)`` → parsed JSON; raises tools.ApiError.
+#: A check run calls it from several threads at once (:meth:`Checker._prefetch`), so an
+#: injected one must be re-entrant and must not depend on the order it is called in.
 ApiFn = Callable[[str, str, str], Any]
 
 
@@ -168,6 +185,7 @@ class Checker:
         self.env = dict(os.environ if env is None else env)
         self.findings: list[Finding] = []
         self.live_oid: dict[str, str | None] = {}
+        self._reads: dict[tuple[str, ...], concurrent.futures.Future[Any]] = {}
 
     def add(self, row: str, cls: str, level: str, text: str) -> None:
         """Record one finding."""
@@ -183,6 +201,8 @@ class Checker:
                 "installed runtime JSON differs from the TOML source; "
                 "run `deploykey sync -i <toml>`",
             )
+        if not self.offline:
+            self._prefetch()
         for key in self.inv.keys.values():
             self.check_key(key)
         for consumer in self.inv.consumers.values():
@@ -192,6 +212,60 @@ class Checker:
                 if key.direction == "write" and key.status != "planned":
                     self.check_policy(key)
         return Report(self.findings)
+
+    # -- the network phase ----------------------------------------------------
+    def _prefetch(self) -> None:
+        """Start every network read of this run at once, and keep its future.
+
+        The rules themselves stay sequential and single-threaded: the worker
+        threads only wait for ``git ls-remote`` and ``gh``/``glab api``, and every
+        finding is still recorded by :meth:`add` on the calling thread, in the
+        same order. What changes is the bound. Each read is capped on its own
+        (60 s), so running them one after the other made a run cost the *sum* of
+        the caps — on the Mac's inventory 21 reads, i.e. up to 21 x 60 s against
+        the status hub's 90 s budget, with a single stalled ssh connection enough
+        to push a healthy ~25 s run past it. Started together, one cap bounds
+        them all.
+        """
+        reads: dict[tuple[str, ...], Callable[[], Any]] = {}
+        for consumer in self.inv.consumers.values():
+            if consumer.status == "planned":
+                continue
+            probe: tuple[str, ...] = ("probe", consumer.label)
+            reads[probe] = functools.partial(self._probe_call, consumer)
+        for key in self.inv.keys.values():
+            if key.direction != "write" or key.status == "planned":
+                continue
+            for branch in self._policy_branches(key):
+                for tool, path, host in self._policy_reads(key, branch):
+                    reads[("api", tool, path, host)] = functools.partial(self.api, tool, path, host)
+        if not reads:
+            return
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(reads), NET_WORKERS), thread_name_prefix="deploykey-read"
+        )
+        try:
+            for name, call in reads.items():
+                self._reads[name] = pool.submit(call)
+        finally:
+            # The submitted work still runs (and is still joined at exit); the pool
+            # only stops accepting more and releases each thread as it finishes.
+            pool.shutdown(wait=False)
+
+    def _read(self, name: tuple[str, ...], call: Callable[[], Any]) -> Any:
+        """The prefetched result of one network read, or *call* run now.
+
+        ``future.result()`` re-raises whatever the read raised, so every caller
+        keeps the exception handling it had when it made the call itself. The
+        fallback keeps a :class:`Checker` method usable on its own, without
+        :meth:`run`.
+        """
+        future = self._reads.pop(name, None)
+        return call() if future is None else future.result()
+
+    def _api(self, tool: str, path: str, host: str) -> Any:
+        """One ``gh``/``glab`` read, prefetched when :meth:`_prefetch` ran."""
+        return self._read(("api", tool, path, host), functools.partial(self.api, tool, path, host))
 
     # -- class 1 --------------------------------------------------------------
     def check_key(self, key: Key) -> None:
@@ -269,19 +343,32 @@ class Checker:
             if self.inv.key_of(consumer).direction == "write":
                 self.check_stuck(consumer)
 
+    def _probe_call(self, consumer: Consumer) -> subprocess.CompletedProcess[str]:
+        """The one network read of :meth:`probe`; raises what :meth:`probe` catches.
+
+        Runs in a prefetch worker thread: it builds its own environment from the
+        inventory and the ``__init__`` snapshot of ``os.environ``, and records no
+        finding — :meth:`probe` does that on the calling thread.
+        """
+        key = self.inv.key_of(consumer)
+        _, dst = validate_refspec(consumer.refspec, key.direction)
+        env = git_env(self.inv, consumer, self.env)
+        return git(
+            consumer,
+            "ls-remote",
+            consumer.remote,
+            dst,
+            env=env,
+            timeout=min(60, self.inv.settings.net_timeout_s or 60),
+        )
+
     def probe(self, consumer: Consumer) -> None:
         """Read-only ``git ls-remote`` of the row's branch through its key (config evidence)."""
         key = self.inv.key_of(consumer)
         _, dst = validate_refspec(consumer.refspec, key.direction)
         try:
-            env = git_env(self.inv, consumer, self.env)
-            proc = git(
-                consumer,
-                "ls-remote",
-                consumer.remote,
-                dst,
-                env=env,
-                timeout=min(60, self.inv.settings.net_timeout_s or 60),
+            proc = self._read(
+                ("probe", consumer.label), functools.partial(self._probe_call, consumer)
             )
         except RefusedError as exc:
             self.add(consumer.label, "key-config", "problem", f"probe refused: {exc}")
@@ -437,18 +524,38 @@ class Checker:
             )
 
     # -- class 5 --------------------------------------------------------------
-    def check_policy(self, key: Key) -> None:
-        """The write repository is append-only on its default branch(es)."""
-        from .tools import ApiError  # pylint: disable=import-outside-toplevel
-
-        branches = sorted(
+    def _policy_branches(self, key: Key) -> list[str]:
+        """The branches :meth:`check_policy` reads the policy of, in a stable order."""
+        return sorted(
             {
                 validate_refspec(c.refspec, "write")[1][len("refs/heads/") :]
                 for c in self.inv.consumers.values()
                 if c.key == key.name and c.status != "planned"
             }
         ) or ["main"]
-        for branch in branches:
+
+    def _policy_reads(self, key: Key, branch: str) -> list[tuple[str, str, str]]:
+        """Every ``(tool, path, host)`` the policy of *key*'s *branch* is read from.
+
+        GitHub's two reads are listed together although ``_github_policy`` only
+        needs the ruleset when the effective rules are complete: prefetching both
+        keeps one API call's cap the bound of the run (two chained ones would be
+        two), at the price of one extra read-only ``GET`` in the rare case where
+        the first read already decides. Deduplicated in :meth:`_prefetch`.
+        """
+        if key.host == "github.com":
+            return [
+                ("gh", f"repos/{key.repo}/rules/branches/{branch}", ""),
+                ("gh", f"repos/{key.repo}/rulesets/{key.policy_id}", ""),
+            ]
+        project = urllib.parse.quote(key.repo, safe="")
+        return [("glab", f"projects/{project}/protected_branches/{branch}", key.host)]
+
+    def check_policy(self, key: Key) -> None:
+        """The write repository is append-only on its default branch(es)."""
+        from .tools import ApiError  # pylint: disable=import-outside-toplevel
+
+        for branch in self._policy_branches(key):
             try:
                 problem = (
                     self._github_policy(key, branch)
@@ -457,25 +564,29 @@ class Checker:
                 )
             except ApiError as exc:
                 problem = f"cannot read the policy: {exc}"
+            except subprocess.TimeoutExpired as exc:
+                # tools.api_json caps gh/glab; uncaught it would abort the whole
+                # run and leave the hub without a verdict instead of this finding.
+                problem = f"cannot read the policy: timed out after {exc.timeout:g}s"
             except RefusedError as exc:
                 problem = str(exc)
             if problem:
                 self.add(key.name, "policy", "problem", f"{key.repo}:{branch}: {problem}")
 
     def _github_policy(self, key: Key, branch: str) -> str:
-        rules = self.api("gh", f"repos/{key.repo}/rules/branches/{branch}", "") or []
+        reads = self._policy_reads(key, branch)
+        rules = self._api(*reads[0]) or []
         types = {r.get("type") for r in rules if isinstance(r, dict)}
         missing = sorted({"deletion", "non_fast_forward"} - types)
         if missing:
             return f"effective rules lack {', '.join(missing)}"
-        ruleset = self.api("gh", f"repos/{key.repo}/rulesets/{key.policy_id}", "") or {}
+        ruleset = self._api(*reads[1]) or {}
         if ruleset.get("enforcement") != "active":
             return f"ruleset {key.policy_id} enforcement is {ruleset.get('enforcement')!r}"
         return ""
 
     def _gitlab_policy(self, key: Key, branch: str) -> str:
-        project = urllib.parse.quote(key.repo, safe="")
-        data = self.api("glab", f"projects/{project}/protected_branches/{branch}", key.host) or {}
+        data = self._api(*self._policy_reads(key, branch)[0]) or {}
         if key.policy_id is not None and data.get("id") != key.policy_id:
             return f"protected branch id {data.get('id')} != policy_id {key.policy_id}"
         return protected_branch_problem(data, key.remote_key_id)
