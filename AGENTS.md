@@ -41,7 +41,12 @@ credplane `deploy/mac/deploy-keys.toml`, plan `PLAN_unattended-push-keys.md`, tp
   or the library; they never re-implement a check.
 - Every CLI option has a short flag; `-h` works on both CLIs.
 - Refusals happen before any network call and exit 3; network failures exit 4 and keep
-  local commits. Never add an automatic rebase, force push or retry loop.
+  local commits. Never add an automatic rebase or force push. `push` and `run` never
+  retry a network operation; the schedule remains the default retry. The one exception:
+  `deploy-git pull` may make at most 3 total attempts of only its pre-merge, read-only
+  `git fetch`, and only for allowlisted client-side transient transport failures while
+  `net_timeout_s > 0`. Authentication, authorization, host-key, protocol, ref-update,
+  merge and local-command failures are never retried. Exhaustion still exits 4.
 - Tests never touch real keys, real remotes or the real inventory: use `tests/support.py`
   (temp keys, fake ssh serving local bare repos, `DEPLOYKEY_CONFIG` pointing into the
   sandbox, `GIT_CONFIG_GLOBAL` isolated).

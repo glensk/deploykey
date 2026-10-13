@@ -4,7 +4,9 @@ The fake ssh is a /bin/sh script baked with the sandbox root: it records its arg
 (one file per call) and serves ``git-receive-pack``/``git-upload-pack`` from
 ``<root>/remotes/<host>/<path>`` with the local git, so every network operation
 runs end to end without leaving the machine. ``<root>/deny`` makes it answer like
-an ssh server that rejects the key.
+an ssh server that rejects the key; ``<root>/fail-times`` (a count, decremented on
+each call) plus ``<root>/fail-message`` make the next N calls fail like a blip —
+:meth:`Sandbox.fail_ssh` writes both.
 """
 
 from __future__ import annotations
@@ -32,6 +34,14 @@ for a; do case "$a" in git@*) host="${{a#git@}}";; esac; done
 if [ -f "{root}/deny" ]; then
   echo "git@$host: Permission denied (publickey)." >&2
   exit 255
+fi
+if [ -f "{root}/fail-times" ]; then
+  left=$(cat "{root}/fail-times")
+  if [ "$left" -gt 0 ]; then
+    echo $((left - 1)) > "{root}/fail-times"
+    cat "{root}/fail-message" >&2
+    exit 255
+  fi
 fi
 verb="${{last%% *}}"
 path="${{last#* }}"
@@ -204,6 +214,11 @@ class Sandbox(unittest.TestCase):
     def remote_main(self) -> str:
         """The bare remote's main."""
         return run([GIT, "-C", self.bare, "rev-parse", "refs/heads/main"]).strip()
+
+    def fail_ssh(self, times: int, message: str) -> None:
+        """Make the next *times* fake-ssh calls fail with *message* on stderr (exit 255)."""
+        (self.root / "fail-message").write_text(f"{message}\n")
+        (self.root / "fail-times").write_text(f"{times}\n")
 
     def ssh_calls(self) -> list[list[str]]:
         """Every recorded fake-ssh argv."""

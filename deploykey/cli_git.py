@@ -18,6 +18,10 @@ EPILOG = """\
 exit codes: 0 ok, 2 usage, 3 refused (no network call was made),
             4 network/remote/local-command failure (commits stay local; retry next cycle)
 
+the schedule is the retry: push and run never re-attempt a network operation. Only
+`pull` re-runs its read-only fetch, at most 3 attempts, and only for an allowlisted
+client-side transient transport failure; a retried success says so in its message.
+
 examples:
   deploy-git push sdsc-runai                       # push the row's refspec (HEAD:refs/heads/main)
   deploy-git push tp-autopilot:tp -W /abs/worktree # from a worktree of the same repository

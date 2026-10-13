@@ -16,13 +16,14 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import deploykey
 from deploykey import cli_git, ops
 from deploykey._common import EXIT_FAILED, EXIT_OK, EXIT_REFUSED, DeployKeyError, RefusedError
 from deploykey.gitenv import append_git_config, git_common_dir, git_env, local_env, ssh_command
-from deploykey.inventory import build, parse_remote_url, validate_refspec
+from deploykey.inventory import Inventory, build, parse_remote_url, validate_refspec
 from deploykey.lock import repo_lock
 
 from .support import GIT, Sandbox, run
@@ -745,6 +746,188 @@ class CliTest(Sandbox):
             check=False,
         )
         self.assertEqual(out.stdout.strip(), "dev")
+
+
+RESET = "Connection reset by 20.250.119.67 port 22"
+
+
+class ClassifyTest(unittest.TestCase):
+    """``ops.is_transient``: the allow-list, and everything that must defeat it."""
+
+    def test_measured_transport_diagnostics_are_transient(self) -> None:
+        """Every ssh diagnostic observed for a blip is retried."""
+        for line in (
+            RESET,
+            "kex_exchange_identification: Connection closed by remote host",
+            "ssh: connect to host github.com port 22: Operation timed out",
+            "ssh: connect to host github.com port 22: Connection refused",
+            "ssh: Could not resolve hostname github.com: nodename nor servname provided",
+            "ssh: connect to host github.com port 22: Network is unreachable",
+            "fatal: the remote end hung up unexpectedly",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(ops.is_transient(f"{line}\nfatal: Could not read from remote.\n"))
+
+    def test_terminal_diagnostics_are_never_transient(self) -> None:
+        """A fault another attempt cannot fix is never retried."""
+        for line in (
+            "git@github.com: Permission denied (publickey).",
+            "Host key verification failed.",
+            "@@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@@",
+            "Unable to negotiate with 1.2.3.4: no matching host key type found",
+            "ERROR: Repository not found.",
+            "fatal: couldn't find remote ref refs/heads/nope",
+            "! [remote rejected] main -> main (pre-receive hook declined)",
+        ):
+            with self.subTest(line=line):
+                self.assertFalse(ops.is_transient(f"{line}\nfatal: Could not read from remote.\n"))
+
+    def test_git_envelope_alone_is_not_transient(self) -> None:
+        """The envelope every transport failure carries must decide nothing by itself."""
+        self.assertFalse(
+            ops.is_transient(
+                "fatal: Could not read from remote repository.\n\n"
+                "Please make sure you have the correct access rights\n"
+                "and the repository exists.\n"
+            )
+        )
+
+    def test_terminal_wins_when_both_markers_appear(self) -> None:
+        """A refused key that also reports a reset is terminal, not transient."""
+        self.assertFalse(ops.is_transient(f"{RESET}\ngit@github.com: Permission denied.\n"))
+
+    def test_non_fast_forward_is_never_transient(self) -> None:
+        """A rejected ref update needs a new commit, not another attempt."""
+        self.assertFalse(ops.is_transient("! [rejected] main -> main (non-fast-forward)\n"))
+
+    def test_remote_output_cannot_request_a_retry(self) -> None:
+        """``remote:`` text is server-controlled and is dropped before classifying."""
+        self.assertFalse(ops.is_transient(f"remote: {RESET}\nfatal: push declined\n"))
+
+    def test_unknown_output_is_not_transient(self) -> None:
+        """Anything unrecognised keeps today's fail-on-the-first-try behaviour."""
+        self.assertFalse(ops.is_transient("fatal: something nobody has ever seen\n"))
+
+    def test_diagnostic_is_classified_beyond_the_tail_window(self) -> None:
+        """Classification reads the whole stderr, not ``_tail``'s last six lines."""
+        stderr = RESET + "\n" + "\n".join(f"noise {i}" for i in range(20))
+        self.assertNotIn(RESET, ops._tail(stderr))  # pylint: disable=protected-access
+        self.assertTrue(ops.is_transient(stderr))
+
+
+class RetryTest(Sandbox):
+    """The bounded fetch retry: it absorbs a blip and nothing else."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        patch = mock.patch("deploykey.ops.time.sleep")
+        self.sleep = patch.start()
+        self.addCleanup(patch.stop)
+
+    def pull_inventory(self, **settings: Any) -> Inventory:
+        """An inventory whose settings are overridden."""
+        raw = self.raw_inventory()
+        raw["settings"].update(settings)
+        return self.inventory(raw)
+
+    def advance_remote(self) -> str:
+        """Put one new commit on the bare remote; returns its sha."""
+        other = self.root / "other"
+        run([GIT, "clone", "-q", str(self.bare), other])
+        sha = self.commit(other, "n.txt")
+        run([GIT, "-C", other, "push", "-q", "origin", "main"])
+        return sha
+
+    def test_transient_fetch_is_retried_and_then_succeeds(self) -> None:
+        """One reset connection no longer fails the job: the second attempt pulls."""
+        sha = self.advance_remote()
+        self.fail_ssh(1, RESET)
+        outcome = deploykey.pull(self.inventory(), "demo-pull")
+        self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
+        self.assertEqual(run([GIT, "-C", self.checkout, "rev-parse", "HEAD"]).strip(), sha)
+        self.assertEqual(len(self.ssh_calls()), 2)
+        self.assertIn("after 1 transient retry", outcome.message)
+        self.assertIn(RESET, outcome.message)
+        record = self.evidence("demo-pull")
+        self.assertEqual(record["last_attempt_rc"], 0)
+        self.assertIn("after 1 transient retry", record["last_attempt_message"])
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [2.0])
+
+    def test_two_transient_failures_still_succeed(self) -> None:
+        """The third attempt is still made, after the 2 s and 6 s waits."""
+        sha = self.advance_remote()
+        self.fail_ssh(2, RESET)
+        outcome = deploykey.pull(self.inventory(), "demo-pull")
+        self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
+        self.assertEqual(run([GIT, "-C", self.checkout, "rev-parse", "HEAD"]).strip(), sha)
+        self.assertEqual(len(self.ssh_calls()), 3)
+        self.assertIn("after 2 transient retries", outcome.message)
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [2.0, 6.0])
+
+    def test_transient_exhaustion_fails_after_three_attempts(self) -> None:
+        """A real outage is still exit 4 — the retry only delays the same verdict."""
+        self.fail_ssh(99, RESET)
+        outcome = deploykey.pull(self.inventory(), "demo-pull")
+        self.assertEqual(outcome.rc, EXIT_FAILED)
+        self.assertIn("after 3 attempts", outcome.message)
+        self.assertEqual(len(self.ssh_calls()), 3)
+        self.assertEqual(self.evidence("demo-pull")["last_attempt_rc"], EXIT_FAILED)
+
+    def test_refused_key_is_not_retried(self) -> None:
+        """A terminal failure still costs exactly one attempt."""
+        (self.root / "deny").write_text("")
+        outcome = deploykey.pull(self.inventory(), "demo-pull")
+        self.assertEqual(outcome.rc, EXIT_FAILED)
+        self.assertEqual(len(self.ssh_calls()), 1)
+        self.assertNotIn("attempts", outcome.message)
+        self.sleep.assert_not_called()
+
+    def test_unknown_failure_is_not_retried(self) -> None:
+        """An unrecognised diagnostic keeps the single-attempt behaviour."""
+        self.fail_ssh(99, "fatal: a diagnostic nobody has ever seen")
+        outcome = deploykey.pull(self.inventory(), "demo-pull")
+        self.assertEqual(outcome.rc, EXIT_FAILED)
+        self.assertEqual(len(self.ssh_calls()), 1)
+        self.sleep.assert_not_called()
+
+    def test_no_retry_without_a_per_attempt_timeout(self) -> None:
+        """``net_timeout_s = 0`` cannot bound an attempt, so there is exactly one."""
+        self.fail_ssh(99, RESET)
+        outcome = deploykey.pull(self.pull_inventory(net_timeout_s=0), "demo-pull")
+        self.assertEqual(outcome.rc, EXIT_FAILED)
+        self.assertEqual(len(self.ssh_calls()), 1)
+        self.sleep.assert_not_called()
+
+    def test_deadline_stops_further_attempts(self) -> None:
+        """The wall-clock ceiling wins even while attempts remain."""
+        self.fail_ssh(99, RESET)
+        with mock.patch.object(ops, "_RETRY_DEADLINE_S", 1.0):
+            outcome = deploykey.pull(self.inventory(), "demo-pull")
+        self.assertEqual(outcome.rc, EXIT_FAILED)
+        self.assertEqual(len(self.ssh_calls()), 1)
+        self.sleep.assert_not_called()
+
+    def test_a_timed_out_attempt_is_retried(self) -> None:
+        """A hung connection is transient; the retry's success is what counts."""
+        ok = subprocess.CompletedProcess(["git"], 0, "", "")
+        calls = [subprocess.TimeoutExpired("git", 60), subprocess.TimeoutExpired("git", 60), ok]
+        with mock.patch.object(ops, "git", side_effect=calls) as fake:
+            net = ops._network(  # pylint: disable=protected-access
+                self.inventory(), self.inventory().consumer("demo-pull"), "fetch", env={}
+            )
+        self.assertEqual(fake.call_count, 3)
+        self.assertEqual(net.attempts, 3)
+        self.assertIs(net.proc, ok)
+        self.assertEqual(net.first_error, "timed out")
+
+    def test_push_is_never_retried(self) -> None:
+        """The write path keeps the schedule as its only retry (local pre-push hooks)."""
+        self.fail_ssh(99, RESET)
+        self.commit(self.checkout)
+        outcome = deploykey.push(self.inventory(), "demo-push")
+        self.assertEqual(outcome.rc, EXIT_FAILED)
+        self.assertEqual(len(self.ssh_calls()), 1)
+        self.sleep.assert_not_called()
 
 
 if __name__ == "__main__":
