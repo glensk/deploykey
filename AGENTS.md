@@ -14,6 +14,10 @@ credplane `deploy/mac/deploy-keys.toml`, plan `PLAN_unattended-push-keys.md`, tp
 
 - `uv` for everything: `uv sync`, `uv run …`. The CLI is installed per commit sha with
   `uv tool install git+https://github.com/glensk/deploykey@<sha>` (README "Install").
+- Landing a release includes moving every pin to the new sha with credplane's
+  `deploy/bump_deploykey.py -s <sha>`, which also commits in llm-staff and
+  sdsc-automations. An agent landing a release runs it without asking (Albert,
+  2026-10-14); until it has, `deploykey check` reports `helper_sha` mismatches.
 - No secrets in this repo, ever: no key material, no inventories, no host names beyond
   examples. Tests generate throw-away keys in temp directories.
 
