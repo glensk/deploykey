@@ -19,7 +19,7 @@ import subprocess  # nosec B404 - fixed argv, never a shell
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from ._common import SSH_ENV_DROP, RefusedError
+from ._common import SSH_ENV_DROP, RefusedError, run_group
 from .inventory import Consumer, Inventory, Key, parse_remote_url
 
 
@@ -133,14 +133,16 @@ def git(
     timeout: float | None = 60,
     cwd: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the consumer's absolute ``git`` in its checkout (no shell, captured)."""
-    return subprocess.run(  # nosec B603 - absolute git from the inventory
+    """Run the consumer's absolute ``git`` in its checkout (no shell, captured).
+
+    A timeout terminates git's process group gracefully (:func:`run_group`).
+    """
+    return run_group(
         [consumer.git, "-C", cwd or consumer.checkout, *argv],
         capture_output=True,
         text=True,
-        check=False,
         timeout=timeout,
-        env=dict(env) if env is not None else None,
+        env=env,
     )
 
 

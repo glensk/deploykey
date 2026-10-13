@@ -13,8 +13,10 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import deploykey
 from deploykey import cli_git, ops
@@ -594,6 +596,56 @@ class RunAndPublishTest(Sandbox):
         self.assertEqual(ops.resolve_argv0("sh", "/bin:/usr/bin"), "/bin/sh")
         with self.assertRaises(RefusedError):
             ops.resolve_argv0("sh", str(self.root))
+
+    def hung_command(self, *, honour_term: bool) -> tuple[list[str], Path, Path]:
+        """A command that holds a lock file and sleeps past any timeout.
+
+        With *honour_term* it removes the lock and exits on SIGTERM (as git does);
+        without, it ignores SIGTERM. Returns (argv, lock file, pid file).
+        """
+        lock, pidfile, ready = self.root / "index.lock", self.root / "child.pid", "child.ready"
+        handler = (
+            "def bye(*_):\n    os.unlink(LOCK)\n    sys.exit(143)\n"
+            if honour_term
+            else "def bye(*_):\n    pass\n"
+        )
+        script = self.root / "hung.py"
+        script.write_text(
+            "import os, signal, sys, time\n"
+            f"LOCK = {str(lock)!r}\n" + handler + "signal.signal(signal.SIGTERM, bye)\n"
+            "open(LOCK, 'w').close()\n"
+            f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+            f"open({str(self.root / ready)!r}, 'w').close()\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        return [sys.executable, str(script)], lock, pidfile
+
+    def test_run_timeout_lets_the_command_remove_its_lock(self) -> None:
+        """A timed-out command gets SIGTERM first, so git-style lock cleanup runs."""
+        argv, lock, _ = self.hung_command(honour_term=True)
+        before = self.remote_main()
+        outcome = deploykey.run(self.inventory(), "demo-push", argv, command_timeout=2.0)
+        self.assertEqual(outcome.rc, EXIT_FAILED)
+        self.assertEqual(outcome.message, f"{argv[0]} timed out; nothing pushed")
+        self.assertTrue((self.root / "child.ready").exists(), "child never started")
+        self.assertFalse(lock.exists(), "SIGTERM handler did not run: lock left behind")
+        self.assertEqual(self.remote_main(), before)
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_run_timeout_kills_a_command_that_ignores_sigterm(self) -> None:
+        """A command that ignores SIGTERM is SIGKILLed once the grace period is over."""
+        argv, lock, pidfile = self.hung_command(honour_term=False)
+        started = time.monotonic()
+        with mock.patch("deploykey._common.TERM_GRACE_S", 0.3):
+            outcome = deploykey.run(self.inventory(), "demo-push", argv, command_timeout=2.0)
+        self.assertLess(time.monotonic() - started, 8)  # < timeout + default grace
+        self.assertEqual(outcome.rc, EXIT_FAILED)
+        self.assertEqual(outcome.message, f"{argv[0]} timed out; nothing pushed")
+        self.assertTrue(lock.exists())
+        pid = int(pidfile.read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
     def test_argv0_ignores_caller_path(self) -> None:
         """A command found only on the caller's PATH is refused."""

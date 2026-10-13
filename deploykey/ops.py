@@ -25,6 +25,7 @@ from ._common import (
     DeployKeyError,
     RefusedError,
     helper_sha,
+    run_group,
 )
 from .gitenv import git, git_common_dir, git_env, local_env, resolve_remote
 from .inventory import Consumer, Inventory, validate_refspec
@@ -329,11 +330,10 @@ def run(
         timeout = inv.settings.lock_timeout_s if lock_timeout is None else lock_timeout
         with repo_lock(git_common_dir(consumer), timeout):
             try:
-                proc = subprocess.run(  # nosec B603 - argv[0] resolved to an absolute path
+                proc = run_group(  # argv[0] resolved to an absolute path
                     [exe, *argv[1:]],
                     cwd=consumer.checkout,
                     env=local_env(env),
-                    check=False,
                     timeout=command_timeout,
                 )
             except subprocess.TimeoutExpired:
