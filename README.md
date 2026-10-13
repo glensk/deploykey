@@ -60,6 +60,11 @@ pins it in its own project: `uv add "deploykey @ git+https://github.com/glensk/d
 - `deploy-git pull` updates only its private ref `refs/deploykey/pull/<branch>`, with `+`
   (a local ref deploykey owns — not a force push); the `merge --ff-only` that follows refuses
   a non-fast-forward (exit 4) and leaves the checkout untouched.
+- No network operation is retried, with one exception: `deploy-git pull` re-runs its
+  read-only fetch (at most 3 attempts, only while `net_timeout_s > 0`) after an allowlisted
+  client-side transient transport failure (connection reset/refused/timed out, unresolved
+  host). Authentication, host-key, protocol, ref-update and merge failures are never
+  retried; exhaustion still exits 4. A retried success names the failure it absorbed.
 - Every attempt rewrites `<evidence>.json` (`last_attempt_at`, `last_attempt_rc`,
   `last_success_at`, `pushed_sha`, `remote_oid`, `helper_sha`); a failure keeps the last
   success fields.
