@@ -249,7 +249,7 @@ def _opt_int(row: dict[str, Any], name: str, where: str) -> int | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise RefusedError(f"{where}: {name} must be a positive integer, got {value!r}")
-    return value
+    return int(value)
 
 
 def _abs_path(value: str, where: str, name: str) -> str:
