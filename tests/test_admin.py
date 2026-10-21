@@ -16,7 +16,13 @@ from typing import Any
 from deploykey import cli_admin, evidence
 from deploykey._common import RefusedError
 from deploykey.audit import installed_jobs, run_audit
-from deploykey.check import Checker, fingerprint_of_public, run_check, uv_lock_sha
+from deploykey.check import (
+    Checker,
+    fingerprint_of_public,
+    run_check,
+    uv_lock_sha,
+    venv_deploykey_sha,
+)
 from deploykey.inventory import build, normalize
 from deploykey.reconcile import Reconciler, protected_branch_body, ruleset_body
 from deploykey.tools import ApiError
@@ -627,6 +633,20 @@ class SyncAndCliTest(Sandbox):
         )
         self.assertEqual(uv_lock_sha(str(lock)), HELPER)
         self.assertIsNone(uv_lock_sha(str(self.root / "missing.lock")))
+
+    def test_venv_deploykey_sha(self) -> None:
+        """The running sha comes from the venv dist's direct_url.json (tp#941)."""
+        self.assertIsNone(venv_deploykey_sha(str(self.root)))  # no venv
+        dist = self.root / ".venv/lib/python3.14/site-packages/deploykey-0.1.0.dist-info"
+        dist.mkdir(parents=True)
+        self.assertIsNone(venv_deploykey_sha(str(self.root)))  # no direct_url.json
+        (dist / "direct_url.json").write_text(
+            '{"url": "https://github.com/glensk/deploykey", '
+            f'"vcs_info": {{"vcs": "git", "commit_id": "{HELPER}"}}}}'
+        )
+        self.assertEqual(venv_deploykey_sha(str(self.root)), HELPER)
+        (dist / "direct_url.json").write_text("{not json")
+        self.assertIsNone(venv_deploykey_sha(str(self.root)))
 
     def test_check_missing_runtime_is_red(self) -> None:
         """A missing runtime JSON makes ``check`` exit 1 with a readable reason."""

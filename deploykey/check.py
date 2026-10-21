@@ -35,7 +35,9 @@ import base64
 import concurrent.futures
 import datetime as _dt
 import functools
+import glob
 import hashlib
+import json
 import os
 import re
 import subprocess  # nosec B404 - fixed argv, never a shell
@@ -159,6 +161,29 @@ def uv_lock_sha(path: str) -> str | None:
         git_url = str((package.get("source") or {}).get("git") or "")
         sha = git_url.rpartition("#")[2]
         return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+    return None
+
+
+def venv_deploykey_sha(project_dir: str) -> str | None:
+    """The commit sha of the ``deploykey`` installed in ``<project_dir>/.venv``.
+
+    Read from the dist's PEP 610 ``direct_url.json`` (``vcs_info.commit_id``), which
+    uv writes for a git install. ``None`` when the venv, the dist or the field is
+    absent. This is what a consumer's launchd job actually imports — a failed
+    ``uv sync`` leaves ``uv.lock`` at the new pin while the venv runs the old one.
+    """
+    pattern = os.path.join(
+        project_dir, ".venv", "lib", "python*", "site-packages", "deploykey-*.dist-info"
+    )
+    for dist in sorted(glob.glob(pattern)):
+        try:
+            with open(os.path.join(dist, "direct_url.json"), encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        sha = str((data.get("vcs_info") or {}).get("commit_id") or "")
+        if re.fullmatch(r"[0-9a-f]{40}", sha):
+            return sha
     return None
 
 
@@ -328,6 +353,18 @@ class Checker:
                         f"{consumer.uv_lock} pins deploykey at {pinned or 'nothing'}, "
                         f"inventory says {consumer.helper_sha[:12]}",
                     )
+                project = os.path.dirname(consumer.uv_lock)
+                if os.path.isdir(os.path.join(project, ".venv")):
+                    running = venv_deploykey_sha(project)
+                    if running != consumer.helper_sha:
+                        self.add(
+                            consumer.label,
+                            "key-config",
+                            "problem",
+                            f"{project}/.venv runs deploykey "
+                            f"{running[:12] if running else 'nothing'}, inventory says "
+                            f"{consumer.helper_sha[:12]} (re-run uv sync there)",
+                        )
             self.check_evidence(consumer)
         else:
             self.add(
