@@ -18,7 +18,13 @@ from pathlib import Path
 from unittest import mock
 
 import deploykey
-from deploykey._common import EXIT_REFUSED, RefusedError, write_json_atomic
+from deploykey._common import (
+    EXIT_OK,
+    EXIT_REFUSED,
+    DeployKeyError,
+    RefusedError,
+    write_json_atomic,
+)
 from deploykey.gitenv import git_common_dir, ssh_command
 from deploykey.lock import LOCK_NAME, repo_lock
 
@@ -180,3 +186,44 @@ class FsyncTest(unittest.TestCase):
             write_json_atomic(self.path, {"new": True})
         self.assertEqual(json.loads(self.path.read_text()), {"old": True})
         self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()), ["evidence.json"])
+
+
+class RemoteEnvTest(Sandbox):
+    """``resolve_remote`` sees the same git config as the push it checks for."""
+
+    OTHER = "git@github.com:glensk/other.git"
+
+    def injected(self, env: dict[str, str]) -> dict[str, str]:
+        """*env* plus a ``GIT_CONFIG_*`` pair pointing origin's push URL elsewhere."""
+        return {
+            **env,
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "remote.origin.pushurl",
+            "GIT_CONFIG_VALUE_0": self.OTHER,
+        }
+
+    def test_base_env_pushurl_is_seen_by_the_remote_check(self) -> None:
+        """Fails on the old code: origin was checked without, then pushed with, the pushurl."""
+        self.commit(self.checkout)
+        before = self.remote_main()
+        for name in ("push", "publish"):
+            with self.subTest(name=name):
+                base = self.injected(dict(os.environ))
+                if name == "push":
+                    rc = deploykey.push(self.inventory(), "demo-push", base=base).rc
+                else:
+                    with self.assertRaises(DeployKeyError):
+                        deploykey.publish(self.inventory(), "demo-push", base=base)
+                    rc = EXIT_REFUSED
+                self.assertEqual(rc, EXIT_REFUSED)
+                self.assertEqual(self.ssh_calls(), [])
+        self.assertEqual(self.remote_main(), before)
+
+    def test_process_env_does_not_decide_the_remote(self) -> None:
+        """A pushurl only in os.environ (not the push's base env) does not refuse the push."""
+        sha = self.commit(self.checkout)
+        clean = dict(os.environ)
+        os.environ.update(self.injected({}))
+        outcome = deploykey.push(self.inventory(), "demo-push", base=clean)
+        self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
+        self.assertEqual(self.remote_main(), sha)
