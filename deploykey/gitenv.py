@@ -23,8 +23,21 @@ from ._common import REPO_ENV_DROP, SSH_ENV_DROP, RefusedError, run_group
 from .inventory import Consumer, Inventory, Key, parse_remote_url
 
 
+def ssh_config_value(value: str, what: str) -> str:
+    """*value* quoted for an ssh ``-o Option=value`` that splits words and expands ``%``.
+
+    ssh parses ``-o`` like an ssh_config line: unquoted whitespace separates values and
+    ``%`` starts a token (``%%`` is a literal ``%``). Double quotes keep spaces; a ``"``,
+    ``\\`` or control character has no portable spelling and is refused.
+    """
+    if any(c in value for c in '"\\') or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise RefusedError(f"{what} {value!r} contains a quote, backslash or control character")
+    return '"' + value.replace("%", "%%") + '"'
+
+
 def ssh_command(ssh: str, key: Key, proxy_command: str = "", connect_timeout: int = 30) -> str:
     """The ``GIT_SSH_COMMAND`` that offers *key* and nothing else."""
+    known_hosts = ssh_config_value(key.known_hosts, "known_hosts")
     argv = [
         ssh,
         "-F", "/dev/null",
@@ -33,7 +46,7 @@ def ssh_command(ssh: str, key: Key, proxy_command: str = "", connect_timeout: in
         "-o", "IdentityAgent=none",
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=yes",
-        "-o", f"UserKnownHostsFile={key.known_hosts}",
+        "-o", f"UserKnownHostsFile={known_hosts}",
         "-o", "GlobalKnownHostsFile=/dev/null",
         "-o", "ControlMaster=no",
         "-o", "ControlPath=none",

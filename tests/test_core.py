@@ -180,7 +180,7 @@ class EnvTest(Sandbox):
             "IdentityAgent=none",
             "BatchMode=yes",
             "StrictHostKeyChecking=yes",
-            f"UserKnownHostsFile={self.known_hosts}",
+            f'UserKnownHostsFile="{self.known_hosts}"',
             "ControlMaster=no",
         ):
             self.assertIn(opt, argv)
