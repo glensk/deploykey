@@ -17,6 +17,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from ._common import RefusedError
+
 LOCK_NAME = "deploykey.lock"
 
 
@@ -28,7 +30,15 @@ class LockBusyError(RuntimeError):
 def repo_lock(common_dir: Path, timeout: float = 600, poll: float = 0.2) -> Iterator[Path]:
     """Hold the exclusive lock of *common_dir*; :class:`LockBusyError` after *timeout* s."""
     path = common_dir / LOCK_NAME
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    # O_NOFOLLOW: a symlink planted at the lock path must not redirect the open (and the
+    # truncate below) to a file elsewhere; it refuses the transaction instead.
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(str(path), flags, 0o600)
+    except OSError as exc:
+        if os.path.islink(path):
+            raise RefusedError(f"{path} is a symlink; refusing to lock through it") from exc
+        raise
     try:
         deadline = time.monotonic() + timeout
         while True:

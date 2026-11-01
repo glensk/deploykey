@@ -23,8 +23,21 @@ from ._common import REPO_ENV_DROP, SSH_ENV_DROP, RefusedError, run_group
 from .inventory import Consumer, Inventory, Key, parse_remote_url
 
 
+def ssh_config_value(value: str, what: str) -> str:
+    """*value* quoted for an ssh ``-o Option=value`` that splits words and expands ``%``.
+
+    ssh parses ``-o`` like an ssh_config line: unquoted whitespace separates values and
+    ``%`` starts a token (``%%`` is a literal ``%``). Double quotes keep spaces; a ``"``,
+    ``\\`` or control character has no portable spelling and is refused.
+    """
+    if any(c in value for c in '"\\') or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise RefusedError(f"{what} {value!r} contains a quote, backslash or control character")
+    return '"' + value.replace("%", "%%") + '"'
+
+
 def ssh_command(ssh: str, key: Key, proxy_command: str = "", connect_timeout: int = 30) -> str:
     """The ``GIT_SSH_COMMAND`` that offers *key* and nothing else."""
+    known_hosts = ssh_config_value(key.known_hosts, "known_hosts")
     argv = [
         ssh,
         "-F", "/dev/null",
@@ -33,7 +46,7 @@ def ssh_command(ssh: str, key: Key, proxy_command: str = "", connect_timeout: in
         "-o", "IdentityAgent=none",
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=yes",
-        "-o", f"UserKnownHostsFile={key.known_hosts}",
+        "-o", f"UserKnownHostsFile={known_hosts}",
         "-o", "GlobalKnownHostsFile=/dev/null",
         "-o", "ControlMaster=no",
         "-o", "ControlPath=none",
@@ -82,8 +95,19 @@ def git_env(
     submodules with this repository's key; ``push.pushOption`` is cleared and tags
     are never followed, so a push carries exactly the one inventory ref.
     """
+    check_key_files(inv.key_of(consumer))
+    return transport_env(inv, consumer, base, extra_config=extra_config)
+
+
+def transport_env(
+    inv: Inventory,
+    consumer: Consumer,
+    base: Mapping[str, str],
+    *,
+    extra_config: Sequence[tuple[str, str]] = (),
+) -> dict[str, str]:
+    """:func:`git_env` without the key-file check (for :func:`resolve_remote` pre-checks)."""
     key = inv.key_of(consumer)
-    check_key_files(key)
     env = {k: v for k, v in base.items() if k not in SSH_ENV_DROP | REPO_ENV_DROP}
     env["GIT_SSH_COMMAND"] = ssh_command(
         inv.settings.ssh,
@@ -163,13 +187,21 @@ def git_common_dir(consumer: Consumer, worktree: str | None = None) -> Path:
     return Path(proc.stdout.strip())
 
 
-def resolve_remote(consumer: Consumer, *, push: bool, cwd: str | None = None) -> str:
+def resolve_remote(
+    consumer: Consumer,
+    *,
+    push: bool,
+    cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
     """The name of the checkout's remote whose (push) URL is the inventory ``remote``.
 
     RefusedError: no such remote, a remote with several URLs, and ``remote.<n>.mirror``.
+    *env* must be the env of the push/fetch itself (:func:`git_env`): ``GIT_CONFIG_*``
+    there can change a remote's URL, and the remote checked must be the one used.
     """
     want = parse_remote_url(consumer.remote)
-    names = git(consumer, "remote", cwd=cwd)
+    names = git(consumer, "remote", env=env, cwd=cwd)
     if names.returncode != 0:
         raise RefusedError(
             f"cannot list remotes in {cwd or consumer.checkout}: {names.stderr.strip()}"
@@ -177,7 +209,7 @@ def resolve_remote(consumer: Consumer, *, push: bool, cwd: str | None = None) ->
     matches = []
     for name in names.stdout.split():
         argv = ["remote", "get-url", "--all", *(["--push"] if push else []), name]
-        urls = git(consumer, *argv, cwd=cwd).stdout.split()
+        urls = git(consumer, *argv, env=env, cwd=cwd).stdout.split()
         try:
             parsed = {parse_remote_url(u) for u in urls}
         except RefusedError:
@@ -194,7 +226,7 @@ def resolve_remote(consumer: Consumer, *, push: bool, cwd: str | None = None) ->
             f"{consumer.remote}"
         )
     name = "origin" if "origin" in matches else sorted(matches)[0]
-    mirror = git(consumer, "config", "--bool", "--get", f"remote.{name}.mirror", cwd=cwd)
+    mirror = git(consumer, "config", "--bool", "--get", f"remote.{name}.mirror", env=env, cwd=cwd)
     if mirror.stdout.strip() == "true":
         raise RefusedError(f"remote.{name}.mirror is set; a mirror push is never allowed")
     return name

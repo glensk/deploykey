@@ -33,7 +33,14 @@ from ._common import (
     helper_sha,
     run_group,
 )
-from .gitenv import git, git_common_dir, git_env, local_env, resolve_remote
+from .gitenv import (
+    git,
+    git_common_dir,
+    git_env,
+    local_env,
+    resolve_remote,
+    transport_env,
+)
 from .inventory import Consumer, Inventory, validate_refspec
 from .lock import LockBusyError, repo_lock
 
@@ -247,7 +254,7 @@ def _push_locked(
     key = inv.key_of(consumer)
     src, dst = validate_refspec(consumer.refspec, key.direction)
     env = git_env(inv, consumer, base)
-    remote = resolve_remote(consumer, push=True, cwd=worktree)
+    remote = resolve_remote(consumer, push=True, cwd=worktree, env=env)
     rev = git(consumer, "rev-parse", "--verify", "--quiet", f"{src}^{{commit}}", cwd=worktree)
     if rev.returncode != 0:
         raise RefusedError(f"{src} does not name a commit in {worktree or consumer.checkout}")
@@ -473,7 +480,7 @@ def pull(
         ref, _ = validate_refspec(consumer.refspec, "read")
         branch = ref[len("refs/heads/") :]
         env = git_env(inv, consumer, env_base)
-        remote = resolve_remote(consumer, push=False)
+        remote = resolve_remote(consumer, push=False, env=env)
         head = git(consumer, "symbolic-ref", "-q", "HEAD").stdout.strip()
         if head != ref:
             raise RefusedError(f"{consumer.checkout} is on {head or 'a detached HEAD'}, not {ref}")
@@ -526,7 +533,7 @@ def run(
             raise RefusedError("run needs a command after --")
         exe = resolve_argv0(argv[0], inv.settings.path)
         validate_refspec(consumer.refspec, inv.key_of(consumer).direction)
-        resolve_remote(consumer, push=True)
+        resolve_remote(consumer, push=True, env=transport_env(inv, consumer, env))
         timeout = inv.settings.lock_timeout_s if lock_timeout is None else lock_timeout
         held.enter_context(repo_lock(git_common_dir(consumer), timeout))
         try:
@@ -566,7 +573,7 @@ def publish(
     def body(held: contextlib.ExitStack) -> Outcome:
         _require_usable(inv, consumer, "write")
         validate_refspec(consumer.refspec, inv.key_of(consumer).direction)
-        resolve_remote(consumer, push=True)
+        resolve_remote(consumer, push=True, env=transport_env(inv, consumer, env))
         timeout = inv.settings.lock_timeout_s if lock_timeout is None else lock_timeout
         held.enter_context(repo_lock(git_common_dir(consumer), timeout))
         if commit is not None:

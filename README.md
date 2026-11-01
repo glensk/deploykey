@@ -113,6 +113,14 @@ runs unattended — any same-user process holds their authority. The bounds that
 one repository per key, one refspec per consumer, and (on the remote) an append-only rule
 on every write branch, so a leaked key can only add fast-forward commits there.
 
+Git hooks run with the deploy key, by design. `git push` runs the checkout's `pre-push`
+hook (and `core.hooksPath` ones) with the push env, including the deploy-key
+`GIT_SSH_COMMAND`, so a hook's own `git fetch`/`push` of that host uses this key too. A
+`deploy-git run` commit command gets no key (`AI_PUSH_LOCAL_ONLY=1`, `GIT_SSH*` dropped),
+but a `publish` callback runs in-process with the caller's env. Hooks are the same-user
+code the paragraph above already trusts; keep them out of repositories you would not
+hand the key to.
+
 ## Development
 
 ```commands
