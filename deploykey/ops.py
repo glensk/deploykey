@@ -318,6 +318,8 @@ def _attempt(
             outcome = Outcome(EXIT_REFUSED, f"refused: {exc}")
         except OSError as exc:
             outcome = Outcome(EXIT_FAILED, f"{operation} failed: {exc}")
+        except subprocess.TimeoutExpired as exc:  # a local git step (rev-parse, remote …)
+            outcome = Outcome(EXIT_FAILED, f"{operation} failed: {exc}")
         evidence.record(
             consumer.evidence,
             consumer=consumer.label,
@@ -554,9 +556,9 @@ def publish(
     """Library form of ``run``: *commit(checkout)* runs in-process under the lock.
 
     Raises :class:`DeployKeyError` when the push is refused (nothing was sent);
-    returns an :class:`Outcome` with ``rc`` 0 or 4 otherwise. An ``OSError`` from
-    *commit* is reported as ``rc`` 4; any other exception propagates after the lock
-    is released. Either way nothing is pushed.
+    returns an :class:`Outcome` with ``rc`` 0 or 4 otherwise. An ``OSError`` (or a
+    ``subprocess.TimeoutExpired``) from *commit* is reported as ``rc`` 4; any other
+    exception propagates after the lock is released. Either way nothing is pushed.
     """
     consumer = inv.consumer(label)
     env = dict(os.environ if base is None else base)

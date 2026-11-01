@@ -468,6 +468,18 @@ class LockTest(Sandbox):
             self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
         self.assertEqual(held, [True, True])
 
+    def test_local_git_timeout_is_a_recorded_failure(self) -> None:
+        """A local git command that times out is exit 4 with evidence, not a traceback."""
+        self.commit(self.checkout)
+        before = self.remote_main()
+        hung = subprocess.TimeoutExpired([GIT, "rev-parse"], 60)
+        with mock.patch.object(ops, "git_common_dir", side_effect=hung):
+            outcome = deploykey.push(self.inventory(), "demo-push")
+        self.assertEqual(outcome.rc, EXIT_FAILED, outcome.message)
+        self.assertIn("timed out", outcome.message)
+        self.assertEqual(self.evidence()["last_attempt_rc"], EXIT_FAILED)
+        self.assertEqual(self.remote_main(), before)
+
 
 class PullTest(Sandbox):
     """``deploykey.pull`` with the read key."""
