@@ -433,6 +433,41 @@ class LockTest(Sandbox):
         thread.join()
         self.assertEqual(order, ["a-in", "a-out", "b-in"])
 
+    def test_evidence_is_written_while_the_lock_is_held(self) -> None:
+        """The evidence of a locked attempt lands before the lock is released.
+
+        Released first, a second job of the same row can push a newer commit and
+        record it before this one writes, which then overwrites ``pushed_sha`` with
+        the older commit (and its read-modify-write drops the other's success).
+        """
+        import fcntl  # pylint: disable=import-outside-toplevel
+
+        self.commit(self.checkout)
+        inv = self.inventory()
+        lock_file = git_common_dir(inv.consumers["demo-push"]) / "deploykey.lock"
+        held: list[bool] = []
+        real = ops.evidence.record
+
+        def probe(*args: Any, **kwargs: Any) -> Any:
+            fd = os.open(str(lock_file), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held.append(False)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BlockingIOError:
+                held.append(True)
+            finally:
+                os.close(fd)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(ops.evidence, "record", probe):
+            outcome = deploykey.push(inv, "demo-push")
+            self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
+            self.commit(self.checkout, "c.txt")
+            outcome = ops.run(inv, "demo-push", ["true"])
+            self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
+        self.assertEqual(held, [True, True])
+
 
 class PullTest(Sandbox):
     """``deploykey.pull`` with the read key."""
