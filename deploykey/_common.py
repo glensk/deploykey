@@ -76,12 +76,33 @@ def write_json_atomic(path: Path, data: Any, mode: int = 0o600) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2, sort_keys=True)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())  # the data is on disk before the rename names it
         os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+    _fsync_dir(path.parent)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """fsync *directory* so a rename in it survives power loss (best-effort).
+
+    Some platforms and file systems refuse to open or fsync a directory; the file
+    itself is already synced, so that refusal is not an error.
+    """
+    try:
+        fd = os.open(str(directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def helper_sha() -> str:

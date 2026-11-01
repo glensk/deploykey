@@ -5,13 +5,20 @@ stdlib ``unittest`` only — this module also runs under macOS's /usr/bin/python
 
 from __future__ import annotations
 
+import errno
+import json
+import os
 import shlex
 import shutil
+import stat
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import deploykey
-from deploykey._common import EXIT_REFUSED, RefusedError
+from deploykey._common import EXIT_REFUSED, RefusedError, write_json_atomic
 from deploykey.gitenv import git_common_dir, ssh_command
 from deploykey.lock import LOCK_NAME, repo_lock
 
@@ -121,3 +128,55 @@ class LockSymlinkTest(Sandbox):
         outcome = deploykey.push(inv, "demo-push", lock_timeout=0.2)
         self.assertEqual(outcome.rc, EXIT_REFUSED)
         self.assertEqual(self.ssh_calls(), [])
+
+
+class FsyncTest(unittest.TestCase):
+    """``write_json_atomic`` syncs the file before the rename and the directory after."""
+
+    def setUp(self) -> None:
+        # pylint: disable-next=consider-using-with  # cleaned up in tearDown
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "sub" / "evidence.json"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_fsync_file_then_replace_then_directory(self) -> None:
+        """Fails on the old code, which never called os.fsync."""
+        calls: list[str] = []
+        real_replace = os.replace
+
+        def fake_fsync(fd: int) -> None:
+            calls.append("fsync-dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync-file")
+
+        def recording_replace(src: str, dst: object) -> None:
+            calls.append("replace")
+            real_replace(src, str(dst))
+
+        with mock.patch("os.fsync", fake_fsync), mock.patch("os.replace", recording_replace):
+            write_json_atomic(self.path, {"a": 1})
+        self.assertEqual(calls, ["fsync-file", "replace", "fsync-dir"])
+        self.assertEqual(json.loads(self.path.read_text()), {"a": 1})
+
+    def test_directory_fsync_refusal_is_tolerated(self) -> None:
+        """A platform that refuses a directory fsync still gets the file written."""
+
+        def fake_fsync(fd: int) -> None:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EINVAL, "directory fsync not supported")
+
+        with mock.patch("os.fsync", fake_fsync):
+            write_json_atomic(self.path, {"b": 2})
+        self.assertEqual(json.loads(self.path.read_text()), {"b": 2})
+
+    def test_file_fsync_failure_propagates_and_keeps_the_old_file(self) -> None:
+        """A failed file fsync (disk error) raises and never renames over the old file."""
+        write_json_atomic(self.path, {"old": True})
+
+        def fake_fsync(fd: int) -> None:
+            raise OSError(errno.EIO, "I/O error")
+
+        with mock.patch("os.fsync", fake_fsync), self.assertRaises(OSError):
+            write_json_atomic(self.path, {"new": True})
+        self.assertEqual(json.loads(self.path.read_text()), {"old": True})
+        self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()), ["evidence.json"])
