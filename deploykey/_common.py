@@ -25,6 +25,22 @@ LOCAL_ONLY_ENV = {"AI_PUSH_LOCAL_ONLY": "1"}
 #: Environment variables that would route git's ssh through anything but the deploy key.
 SSH_ENV_DROP = frozenset({"SSH_AUTH_SOCK", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT"})
 
+#: Environment variables that point git at another repository, work tree, index or object
+#: store than the row's checkout. A git hook exports several of them to its children, and
+#: they override ``git -C <checkout>``: the push would send another repository's HEAD, under
+#: that repository's lock, with this row's key.
+REPO_ENV_DROP = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+    }
+)
+
 #: The runtime inventory ``deploykey sync`` installs and ``deploy-git`` reads.
 DEFAULT_RUNTIME = "~/.ssh/deploy/deploy-keys.json"
 #: Environment override of :data:`DEFAULT_RUNTIME` (tests, a second inventory).

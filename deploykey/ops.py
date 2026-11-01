@@ -299,26 +299,37 @@ def _first(text: str, lines: int = 1) -> str:
     return " | ".join(kept)
 
 
-def _attempt(consumer: Consumer, operation: str, body: Callable[[], Outcome]) -> Outcome:
-    """Run *body*, turn refusals and a busy lock into outcomes, write the evidence record."""
-    try:
-        outcome = body()
-    except LockBusyError as exc:
-        outcome = Outcome(EXIT_FAILED, str(exc))
-    except RefusedError as exc:
-        outcome = Outcome(EXIT_REFUSED, f"refused: {exc}")
-    except OSError as exc:
-        outcome = Outcome(EXIT_FAILED, f"{operation} failed: {exc}")
-    evidence.record(
-        consumer.evidence,
-        consumer=consumer.label,
-        operation=operation,
-        rc=outcome.rc,
-        message=outcome.message,
-        helper=helper_sha(),
-        pushed_sha=outcome.pushed_sha,
-        remote_oid=outcome.remote_oid,
-    )
+def _attempt(
+    consumer: Consumer, operation: str, body: Callable[[contextlib.ExitStack], Outcome]
+) -> Outcome:
+    """Run *body*, turn refusals and a busy lock into outcomes, write the evidence record.
+
+    *body* enters the repository lock into the stack it is given, so the lock is
+    released only after the evidence record has landed: released first, a second job
+    of the same row could push and record a newer commit that this record then
+    overwrites with the older one.
+    """
+    with contextlib.ExitStack() as held:
+        try:
+            outcome = body(held)
+        except LockBusyError as exc:
+            outcome = Outcome(EXIT_FAILED, str(exc))
+        except RefusedError as exc:
+            outcome = Outcome(EXIT_REFUSED, f"refused: {exc}")
+        except OSError as exc:
+            outcome = Outcome(EXIT_FAILED, f"{operation} failed: {exc}")
+        except subprocess.TimeoutExpired as exc:  # a local git step (rev-parse, remote …)
+            outcome = Outcome(EXIT_FAILED, f"{operation} failed: {exc}")
+        evidence.record(
+            consumer.evidence,
+            consumer=consumer.label,
+            operation=operation,
+            rc=outcome.rc,
+            message=outcome.message,
+            helper=helper_sha(),
+            pushed_sha=outcome.pushed_sha,
+            remote_oid=outcome.remote_oid,
+        )
     return outcome
 
 
@@ -334,12 +345,12 @@ def push(
     consumer = inv.consumer(label)
     env = dict(os.environ if base is None else base)
 
-    def body() -> Outcome:
+    def body(held: contextlib.ExitStack) -> Outcome:
         _require_usable(inv, consumer, "write")
         wt = _same_repo(consumer, worktree)
         timeout = inv.settings.lock_timeout_s if lock_timeout is None else lock_timeout
-        with repo_lock(git_common_dir(consumer), timeout):
-            return _push_locked(inv, consumer, env, wt)
+        held.enter_context(repo_lock(git_common_dir(consumer), timeout))
+        return _push_locked(inv, consumer, env, wt)
 
     return _attempt(consumer, "push", body)
 
@@ -457,7 +468,7 @@ def pull(
     consumer = inv.consumer(label)
     env_base = dict(os.environ if base is None else base)
 
-    def body() -> Outcome:
+    def body(held: contextlib.ExitStack) -> Outcome:
         _require_usable(inv, consumer, "read")
         ref, _ = validate_refspec(consumer.refspec, "read")
         branch = ref[len("refs/heads/") :]
@@ -467,8 +478,8 @@ def pull(
         if head != ref:
             raise RefusedError(f"{consumer.checkout} is on {head or 'a detached HEAD'}, not {ref}")
         timeout = inv.settings.lock_timeout_s if lock_timeout is None else lock_timeout
-        with repo_lock(git_common_dir(consumer), timeout):
-            return _pull_locked(inv, consumer, env, remote, branch)
+        held.enter_context(repo_lock(git_common_dir(consumer), timeout))
+        return _pull_locked(inv, consumer, env, remote, branch)
 
     return _attempt(consumer, "pull", body)
 
@@ -509,7 +520,7 @@ def run(
     consumer = inv.consumer(label)
     env = dict(os.environ if base is None else base)
 
-    def body() -> Outcome:
+    def body(held: contextlib.ExitStack) -> Outcome:
         _require_usable(inv, consumer, "write")
         if not argv:
             raise RefusedError("run needs a command after --")
@@ -517,19 +528,19 @@ def run(
         validate_refspec(consumer.refspec, inv.key_of(consumer).direction)
         resolve_remote(consumer, push=True)
         timeout = inv.settings.lock_timeout_s if lock_timeout is None else lock_timeout
-        with repo_lock(git_common_dir(consumer), timeout):
-            try:
-                proc = run_group(  # argv[0] resolved to an absolute path
-                    [exe, *argv[1:]],
-                    cwd=consumer.checkout,
-                    env=local_env(env),
-                    timeout=command_timeout,
-                )
-            except subprocess.TimeoutExpired:
-                return Outcome(EXIT_FAILED, f"{argv[0]} timed out; nothing pushed")
-            if proc.returncode != 0:
-                return Outcome(EXIT_FAILED, f"{argv[0]} exited {proc.returncode}; nothing pushed")
-            return _push_locked(inv, consumer, env, None)
+        held.enter_context(repo_lock(git_common_dir(consumer), timeout))
+        try:
+            proc = run_group(  # argv[0] resolved to an absolute path
+                [exe, *argv[1:]],
+                cwd=consumer.checkout,
+                env=local_env(env),
+                timeout=command_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return Outcome(EXIT_FAILED, f"{argv[0]} timed out; nothing pushed")
+        if proc.returncode != 0:
+            return Outcome(EXIT_FAILED, f"{argv[0]} exited {proc.returncode}; nothing pushed")
+        return _push_locked(inv, consumer, env, None)
 
     return _attempt(consumer, "run", body)
 
@@ -545,22 +556,22 @@ def publish(
     """Library form of ``run``: *commit(checkout)* runs in-process under the lock.
 
     Raises :class:`DeployKeyError` when the push is refused (nothing was sent);
-    returns an :class:`Outcome` with ``rc`` 0 or 4 otherwise. An ``OSError`` from
-    *commit* is reported as ``rc`` 4; any other exception propagates after the lock
-    is released. Either way nothing is pushed.
+    returns an :class:`Outcome` with ``rc`` 0 or 4 otherwise. An ``OSError`` (or a
+    ``subprocess.TimeoutExpired``) from *commit* is reported as ``rc`` 4; any other
+    exception propagates after the lock is released. Either way nothing is pushed.
     """
     consumer = inv.consumer(label)
     env = dict(os.environ if base is None else base)
 
-    def body() -> Outcome:
+    def body(held: contextlib.ExitStack) -> Outcome:
         _require_usable(inv, consumer, "write")
         validate_refspec(consumer.refspec, inv.key_of(consumer).direction)
         resolve_remote(consumer, push=True)
         timeout = inv.settings.lock_timeout_s if lock_timeout is None else lock_timeout
-        with repo_lock(git_common_dir(consumer), timeout):
-            if commit is not None:
-                commit(Path(consumer.checkout))
-            return _push_locked(inv, consumer, env, None)
+        held.enter_context(repo_lock(git_common_dir(consumer), timeout))
+        if commit is not None:
+            commit(Path(consumer.checkout))
+        return _push_locked(inv, consumer, env, None)
 
     outcome = _attempt(consumer, "publish", body)
     if outcome.rc == EXIT_REFUSED:

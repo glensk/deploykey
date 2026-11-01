@@ -368,6 +368,31 @@ class PushTest(Sandbox):
         outcome = deploykey.push(self.inventory(), "demo-push", worktree=str(stranger))
         self.assertEqual(outcome.rc, EXIT_REFUSED)
 
+    def test_inherited_git_dir_does_not_redirect_the_row(self) -> None:
+        """GIT_DIR & co. from a caller (a git hook exports them) do not swap the repository.
+
+        Without the scrub, ``git -C <checkout>`` honours ``GIT_DIR`` of the other
+        repository: its HEAD is pushed, under ITS lock, with this row's key.
+        """
+        other = self.root / "other"
+        run([GIT, "init", "-q", "-b", "main", other])
+        self.commit(other, "o.txt")
+        run([GIT, "-C", other, "remote", "add", "origin", self.URL])
+        sha = self.commit(self.checkout)
+        hook_env = {
+            "GIT_DIR": str(other / ".git"),
+            "GIT_WORK_TREE": str(other),
+            "GIT_INDEX_FILE": str(other / ".git" / "index"),
+        }
+        with mock.patch.dict(os.environ, hook_env):
+            outcome = deploykey.push(self.inventory(), "demo-push")
+        self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
+        self.assertEqual(self.remote_main(), sha)
+        self.assertFalse((other / ".git" / "deploykey.lock").exists())
+        env = local_env({"GIT_DIR": "/x", "GIT_COMMON_DIR": "/y", "HOME": "/h"})
+        self.assertNotIn("GIT_DIR", env)
+        self.assertNotIn("GIT_COMMON_DIR", env)
+
 
 class LockTest(Sandbox):
     """The per-repository transaction lock."""
@@ -407,6 +432,53 @@ class LockTest(Sandbox):
             order.append("b-in")
         thread.join()
         self.assertEqual(order, ["a-in", "a-out", "b-in"])
+
+    def test_evidence_is_written_while_the_lock_is_held(self) -> None:
+        """The evidence of a locked attempt lands before the lock is released.
+
+        Released first, a second job of the same row can push a newer commit and
+        record it before this one writes, which then overwrites ``pushed_sha`` with
+        the older commit (and its read-modify-write drops the other's success).
+        """
+        import fcntl  # pylint: disable=import-outside-toplevel
+
+        self.commit(self.checkout)
+        inv = self.inventory()
+        lock_file = git_common_dir(inv.consumers["demo-push"]) / "deploykey.lock"
+        held: list[bool] = []
+        real = ops.evidence.record
+
+        def probe(*args: Any, **kwargs: Any) -> Any:
+            fd = os.open(str(lock_file), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held.append(False)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BlockingIOError:
+                held.append(True)
+            finally:
+                os.close(fd)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(ops.evidence, "record", probe):
+            outcome = deploykey.push(inv, "demo-push")
+            self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
+            self.commit(self.checkout, "c.txt")
+            outcome = ops.run(inv, "demo-push", ["true"])
+            self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
+        self.assertEqual(held, [True, True])
+
+    def test_local_git_timeout_is_a_recorded_failure(self) -> None:
+        """A local git command that times out is exit 4 with evidence, not a traceback."""
+        self.commit(self.checkout)
+        before = self.remote_main()
+        hung = subprocess.TimeoutExpired([GIT, "rev-parse"], 60)
+        with mock.patch.object(ops, "git_common_dir", side_effect=hung):
+            outcome = deploykey.push(self.inventory(), "demo-push")
+        self.assertEqual(outcome.rc, EXIT_FAILED, outcome.message)
+        self.assertIn("timed out", outcome.message)
+        self.assertEqual(self.evidence()["last_attempt_rc"], EXIT_FAILED)
+        self.assertEqual(self.remote_main(), before)
 
 
 class PullTest(Sandbox):
