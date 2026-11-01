@@ -10,8 +10,10 @@ import shutil
 import subprocess
 import unittest
 
-from deploykey._common import RefusedError
-from deploykey.gitenv import ssh_command
+import deploykey
+from deploykey._common import EXIT_REFUSED, RefusedError
+from deploykey.gitenv import git_common_dir, ssh_command
+from deploykey.lock import LOCK_NAME, repo_lock
 
 from .support import Sandbox, run
 
@@ -95,3 +97,27 @@ class KnownHostsQuotingTest(Sandbox):
         for bad in ('/k/a"b', "/k/a\\b", "/k/a\nb"):
             with self.subTest(bad=bad), self.assertRaises(RefusedError):
                 self.odd_command(bad)
+
+
+class LockSymlinkTest(Sandbox):
+    """The repository lock never follows a symlink planted at its path."""
+
+    def test_symlinked_lock_path_is_refused_and_target_untouched(self) -> None:
+        """Fails on the old open without O_NOFOLLOW: it locked and truncated the target."""
+        common = git_common_dir(self.inventory().consumers["demo-push"])
+        target = self.root / "victim.txt"
+        target.write_text("keep me\n")
+        (common / LOCK_NAME).symlink_to(target)
+        with self.assertRaises(RefusedError), repo_lock(common, timeout=0.2):
+            pass
+        self.assertEqual(target.read_text(), "keep me\n")
+
+    def test_symlinked_lock_refuses_the_push(self) -> None:
+        """deploy-git push exits 3 (refused) with no ssh call when the lock is a symlink."""
+        self.commit(self.checkout)
+        inv = self.inventory()
+        common = git_common_dir(inv.consumers["demo-push"])
+        (common / LOCK_NAME).symlink_to(self.root / "absent" / "elsewhere.lock")
+        outcome = deploykey.push(inv, "demo-push", lock_timeout=0.2)
+        self.assertEqual(outcome.rc, EXIT_REFUSED)
+        self.assertEqual(self.ssh_calls(), [])
