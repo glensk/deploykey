@@ -19,7 +19,7 @@ import subprocess  # nosec B404 - fixed argv, never a shell
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from ._common import SSH_ENV_DROP, RefusedError, run_group
+from ._common import REPO_ENV_DROP, SSH_ENV_DROP, RefusedError, run_group
 from .inventory import Consumer, Inventory, Key, parse_remote_url
 
 
@@ -84,7 +84,7 @@ def git_env(
     """
     key = inv.key_of(consumer)
     check_key_files(key)
-    env = {k: v for k, v in base.items() if k not in SSH_ENV_DROP}
+    env = {k: v for k, v in base.items() if k not in SSH_ENV_DROP | REPO_ENV_DROP}
     env["GIT_SSH_COMMAND"] = ssh_command(
         inv.settings.ssh,
         key,
@@ -120,7 +120,7 @@ def append_git_config(env: dict[str, str], pairs: Sequence[tuple[str, str]]) -> 
 
 def local_env(base: Mapping[str, str]) -> dict[str, str]:
     """The env of a commit command ``deploy-git run`` starts: no key, no agent, no push."""
-    env = {k: v for k, v in base.items() if k not in SSH_ENV_DROP}
+    env = {k: v for k, v in base.items() if k not in SSH_ENV_DROP | REPO_ENV_DROP}
     env["AI_PUSH_LOCAL_ONLY"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
@@ -135,14 +135,16 @@ def git(
 ) -> subprocess.CompletedProcess[str]:
     """Run the consumer's absolute ``git`` in its checkout (no shell, captured).
 
-    A timeout terminates git's process group gracefully (:func:`run_group`).
+    A timeout terminates git's process group gracefully (:func:`run_group`). *env*
+    (default ``os.environ``) loses :data:`REPO_ENV_DROP`, so ``-C`` decides the repository.
     """
+    source = os.environ if env is None else env
     return run_group(
         [consumer.git, "-C", cwd or consumer.checkout, *argv],
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=env,
+        env={k: v for k, v in source.items() if k not in REPO_ENV_DROP},
     )
 
 

@@ -368,6 +368,31 @@ class PushTest(Sandbox):
         outcome = deploykey.push(self.inventory(), "demo-push", worktree=str(stranger))
         self.assertEqual(outcome.rc, EXIT_REFUSED)
 
+    def test_inherited_git_dir_does_not_redirect_the_row(self) -> None:
+        """GIT_DIR & co. from a caller (a git hook exports them) do not swap the repository.
+
+        Without the scrub, ``git -C <checkout>`` honours ``GIT_DIR`` of the other
+        repository: its HEAD is pushed, under ITS lock, with this row's key.
+        """
+        other = self.root / "other"
+        run([GIT, "init", "-q", "-b", "main", other])
+        self.commit(other, "o.txt")
+        run([GIT, "-C", other, "remote", "add", "origin", self.URL])
+        sha = self.commit(self.checkout)
+        hook_env = {
+            "GIT_DIR": str(other / ".git"),
+            "GIT_WORK_TREE": str(other),
+            "GIT_INDEX_FILE": str(other / ".git" / "index"),
+        }
+        with mock.patch.dict(os.environ, hook_env):
+            outcome = deploykey.push(self.inventory(), "demo-push")
+        self.assertEqual(outcome.rc, EXIT_OK, outcome.message)
+        self.assertEqual(self.remote_main(), sha)
+        self.assertFalse((other / ".git" / "deploykey.lock").exists())
+        env = local_env({"GIT_DIR": "/x", "GIT_COMMON_DIR": "/y", "HOME": "/h"})
+        self.assertNotIn("GIT_DIR", env)
+        self.assertNotIn("GIT_COMMON_DIR", env)
+
 
 class LockTest(Sandbox):
     """The per-repository transaction lock."""
