@@ -10,7 +10,7 @@ keywords = ["git", "ssh", "deploy-key", "launchd", "automation"]
 # The runtime core (deploy-git, the library) is stdlib-only and runs on Python 3.9.
 # Only the admin commands (check policy, reconcile) resolve gh/glab through extdeps.
 dependencies = [
-    "extdeps @ git+https://github.com/glensk/extdeps@83196893a2966c8167c0a36a878883705746c9d9 ; python_version >= '3.10'",
+    "extdeps @ git+https://github.com/glensk/extdeps@6dd3c0abff8dbbd111df14eb483cdde9b1c68900 ; python_version >= '3.10'",
 ]
 
 [project.urls]
